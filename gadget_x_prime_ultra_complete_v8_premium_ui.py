@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import imageio_ffmpeg
 import nest_asyncio
@@ -151,6 +152,7 @@ DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlpool")
 ACTIVE_CHAT_JOBS: set[int] = set()
 ACTIVE_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
+URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 
 
 # ---------------------------
@@ -207,6 +209,60 @@ def cfg() -> Dict[str, Any]:
 
 def is_url(text: str) -> bool:
     return bool(URL_RE.match((text or "").strip()))
+
+
+def extract_first_url(text: str) -> str:
+    if not text:
+        return ""
+    match = URL_EXTRACT_RE.search(text.strip())
+    return (match.group(1) if match else "").strip()
+
+
+def prettify_extractor_name(name: str) -> str:
+    raw = (name or "Unknown").strip()
+    if not raw:
+        return "Unknown"
+    return raw.replace("_", " ").replace("IE", "").strip().title()
+
+
+def normalize_public_url(url: str) -> str:
+    """
+    Clean up copied social/share links so yt-dlp has a better chance to resolve
+    platform redirect/short URLs on the first try.
+    """
+    cleaned = (url or "").strip().replace("\u200b", "")
+    cleaned = cleaned.split()[0] if cleaned else ""
+    cleaned = cleaned.strip("<>\"'")
+
+    parsed = urlparse(cleaned)
+    host = (parsed.netloc or "").lower().lstrip("www.")
+    path = parsed.path or ""
+
+    # Convert /share/ links into canonical /reel/ links when possible.
+    if host.endswith("instagram.com") and "/share/" in path:
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == "share":
+            cleaned = f"https://instagram.com/reel/{parts[1]}/"
+            parsed = urlparse(cleaned)
+            host = (parsed.netloc or "").lower().lstrip("www.")
+
+    # Expand YouTube short links with v parameter when present.
+    if host == "youtu.be":
+        video_id = path.strip("/")
+        if video_id:
+            cleaned = f"https://www.youtube.com/watch?v={video_id}"
+            parsed = urlparse(cleaned)
+            host = (parsed.netloc or "").lower().lstrip("www.")
+
+    # For tiktok short links keep clean path only.
+    if host in ("vt.tiktok.com", "vm.tiktok.com"):
+        cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
+
+    # Remove tracking query for Instagram/Facebook style links.
+    # Keep query for some shorteners (e.g. YouTube list URLs).
+    if "instagram.com/" in cleaned or "facebook.com/" in cleaned or "tiktok.com/" in cleaned:
+        cleaned = cleaned.split("?", 1)[0]
+    return cleaned
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -572,14 +628,17 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
     if not info:
         raise RuntimeError("Unable to extract media info")
 
+    title = info.get("title") or "Untitled"
+    extractor_name = prettify_extractor_name(info.get("extractor_key") or info.get("extractor") or "Unknown")
+
     return {
-        "title": info.get("title") or "Untitled",
+        "title": title,
         "webpage_url": info.get("webpage_url") or url,
         "duration": info.get("duration"),
         "uploader": info.get("uploader") or info.get("channel") or "Unknown",
         "view_count": info.get("view_count"),
         "thumbnail": info.get("thumbnail"),
-        "extractor": info.get("extractor_key") or info.get("extractor") or "Unknown",
+        "extractor": extractor_name,
         "description": info.get("description") or "",
         "id": info.get("id") or "",
         "formats": info.get("formats") or [],
@@ -928,7 +987,7 @@ def cmd_help(message):
             "• /start — main menu\n"
             "• /cancel — clear current waiting state\n"
             "• Send song name — when Search Music asks for it\n"
-            "• Send supported direct URL — when Download by Link asks for it\n"
+            "• Send supported direct URL — bot also auto-detects links\n"
             "• Send audio/voice/video/document — for Shazam recognition"
         ),
     )
@@ -1364,9 +1423,16 @@ def on_text(message):
 
     st = get_state(message.from_user.id).get("state", "")
     txt = (message.text or "").strip()
+    raw_url = extract_first_url(txt)
     if not txt:
         bot.reply_to(message, "ℹ️ Send text, a search query, or a URL.")
         return
+
+    # Advanced UX fallback:
+    # If user sends a direct URL without opening "Download by Link" first,
+    # process it automatically instead of forcing button flow.
+    if st != "await_direct_url" and is_url(raw_url):
+        st = "await_direct_url"
 
     if st == "await_redeem":
         if not cfg().get("feature_flags", {}).get("redeem", True):
@@ -1417,19 +1483,33 @@ def on_text(message):
         return
 
     if st == "await_direct_url":
-        clear_state(message.from_user.id)
-        if not is_url(txt):
+        normalized_url = normalize_public_url(raw_url or txt)
+        if not is_url(normalized_url):
             bot.reply_to(message, "❌ Please send a valid URL starting with http:// or https://")
             return
         status = bot.reply_to(message, "🌐 <i>Reading media info…</i>")
         animate(message.chat.id, status.message_id, progress_frames("search"), 0.6)
         try:
-            info = extract_direct_info(txt)
-            sid = cache_put({"type": "direct", "query": txt, "entries": [info]})
+            info = extract_direct_info(normalized_url)
+            clear_state(message.from_user.id)
+            sid = cache_put({"type": "direct", "query": normalized_url, "entries": [info]})
             text, kb = render_media_entry(sid, 0)
             safe_edit(message.chat.id, status.message_id, text, reply_markup=kb)
         except Exception as exc:
-            safe_edit(message.chat.id, status.message_id, f"❌ <b>Link processing failed</b>\n<code>{esc(str(exc)[:300])}</code>", reply_markup=back_kb())
+            safe_edit(
+                message.chat.id,
+                status.message_id,
+                (
+                    "❌ <b>Link processing failed</b>\n"
+                    f"<code>{esc(str(exc)[:260])}</code>\n\n"
+                    "Try:\n"
+                    "• Resend the final public post/video URL (not copied shortcut)\n"
+                    "• For Instagram/Facebook, open post in browser and copy full URL\n"
+                    "• If TikTok short link fails, open it once in browser and copy final URL\n"
+                    "• If private/age-locked, public access is required"
+                ),
+                reply_markup=back_kb(),
+            )
         return
 
     if st == "adm_set_bonus" and is_admin(message.from_user.id):
