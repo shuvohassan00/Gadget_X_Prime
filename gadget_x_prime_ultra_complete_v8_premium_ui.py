@@ -148,6 +148,7 @@ config_col.update_one({"_id": "global"}, {"$setOnInsert": DEFAULT_CONFIG}, upser
 # ---------------------------
 SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_LOCK = threading.Lock()
+DIRECT_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlpool")
 ACTIVE_CHAT_JOBS: set[int] = set()
 ACTIVE_LOCK = threading.Lock()
@@ -560,6 +561,27 @@ def cache_cleanup() -> None:
         to_del = [k for k, v in SEARCH_CACHE.items() if time.time() - v.get("created_at", time.time()) > 3600]
         for key in to_del:
             SEARCH_CACHE.pop(key, None)
+        direct_del = [k for k, v in DIRECT_INFO_CACHE.items() if time.time() - v.get("created_at", time.time()) > 900]
+        for key in direct_del:
+            DIRECT_INFO_CACHE.pop(key, None)
+
+
+def get_cached_direct_info(url: str) -> Optional[Dict[str, Any]]:
+    with CACHE_LOCK:
+        item = DIRECT_INFO_CACHE.get(url)
+        if item and time.time() - item.get("created_at", 0) <= 900:
+            return item.get("info")
+        if item:
+            DIRECT_INFO_CACHE.pop(url, None)
+    return None
+
+
+def put_cached_direct_info(url: str, info: Dict[str, Any]) -> None:
+    with CACHE_LOCK:
+        DIRECT_INFO_CACHE[url] = {
+            "created_at": time.time(),
+            "info": info,
+        }
 
 
 def acquire_chat_job(chat_id: int) -> bool:
@@ -643,6 +665,18 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
         "id": info.get("id") or "",
         "formats": info.get("formats") or [],
     }
+
+
+def process_search_query(chat_id: int, query: str):
+    status = bot.send_message(chat_id, "🔎 <i>Searching…</i>")
+    animate(chat_id, status.message_id, progress_frames("search"), 0.6)
+    results = search_media(query, limit=8)
+    if not results:
+        safe_edit(chat_id, status.message_id, "❌ No results found.", reply_markup=back_kb())
+        return
+    sid = cache_put({"type": "search", "query": query, "entries": results})
+    text, kb = render_search_results(sid)
+    safe_edit(chat_id, status.message_id, text, reply_markup=kb)
 
 
 def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
@@ -985,12 +1019,18 @@ def cmd_help(message):
         (
             "🆘 <b>Help</b>\n"
             "• /start — main menu\n"
+            "• /menu — open main menu\n"
             "• /cancel — clear current waiting state\n"
-            "• Send song name — when Search Music asks for it\n"
+            "• Send song name — auto search works directly\n"
             "• Send supported direct URL — bot also auto-detects links\n"
             "• Send audio/voice/video/document — for Shazam recognition"
         ),
     )
+
+
+@bot.message_handler(commands=["menu"])
+def cmd_menu(message):
+    cmd_start(message)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -1468,18 +1508,14 @@ def on_text(message):
         if not YTDLP_OK:
             bot.reply_to(message, "❌ yt-dlp not installed.")
             return
-        status = bot.reply_to(message, "🔎 <i>Searching…</i>")
-        animate(message.chat.id, status.message_id, progress_frames("search"), 0.6)
         try:
-            results = search_media(txt, limit=8)
-            if not results:
-                safe_edit(message.chat.id, status.message_id, "❌ No results found.", reply_markup=back_kb())
-                return
-            sid = cache_put({"type": "search", "query": txt, "entries": results})
-            text, kb = render_search_results(sid)
-            safe_edit(message.chat.id, status.message_id, text, reply_markup=kb)
+            process_search_query(message.chat.id, txt)
         except Exception as exc:
-            safe_edit(message.chat.id, status.message_id, f"❌ <b>Search failed</b>\n<code>{esc(str(exc)[:300])}</code>", reply_markup=back_kb())
+            bot.send_message(
+                message.chat.id,
+                f"❌ <b>Search failed</b>\n<code>{esc(str(exc)[:300])}</code>",
+                reply_markup=back_kb(),
+            )
         return
 
     if st == "await_direct_url":
@@ -1490,7 +1526,8 @@ def on_text(message):
         status = bot.reply_to(message, "🌐 <i>Reading media info…</i>")
         animate(message.chat.id, status.message_id, progress_frames("search"), 0.6)
         try:
-            info = extract_direct_info(normalized_url)
+            info = get_cached_direct_info(normalized_url) or extract_direct_info(normalized_url)
+            put_cached_direct_info(normalized_url, info)
             clear_state(message.from_user.id)
             sid = cache_put({"type": "direct", "query": normalized_url, "entries": [info]})
             text, kb = render_media_entry(sid, 0)
@@ -1508,6 +1545,23 @@ def on_text(message):
                     "• If TikTok short link fails, open it once in browser and copy final URL\n"
                     "• If private/age-locked, public access is required"
                 ),
+                reply_markup=back_kb(),
+            )
+        return
+
+    if not st and not raw_url and not txt.startswith("/"):
+        if len(txt) < 2:
+            bot.reply_to(message, "ℹ️ Please send a longer query.")
+            return
+        if not YTDLP_OK:
+            bot.reply_to(message, "❌ yt-dlp not installed.")
+            return
+        try:
+            process_search_query(message.chat.id, txt)
+        except Exception as exc:
+            bot.send_message(
+                message.chat.id,
+                f"❌ <b>Search failed</b>\n<code>{esc(str(exc)[:300])}</code>",
                 reply_markup=back_kb(),
             )
         return
@@ -1884,6 +1938,7 @@ def startup_check() -> None:
     try:
         bot.set_my_commands([
             BotCommand("start", "Open the ultra home menu"),
+            BotCommand("menu", "Open menu quickly"),
             BotCommand("help", "Show help"),
             BotCommand("cancel", "Cancel current input state"),
         ])
