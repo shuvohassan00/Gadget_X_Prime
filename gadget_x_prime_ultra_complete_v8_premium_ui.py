@@ -811,7 +811,7 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
             f"best[height<={max_height}]/best"
         )
     else:
-        format_selector = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        format_selector = "bestvideo*+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best"
 
     opts = yt_base_opts() | {
         "outtmpl": outtmpl,
@@ -953,7 +953,7 @@ def render_media_entry(search_id: str, idx: int) -> tuple[str, InlineKeyboardMar
         f"🌐 <b>Source:</b> <code>{esc(entry.get('extractor', 'Unknown'))}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🎧 Choose <b>Audio</b> for MP3\n"
-        f"🎞 Choose <b>Video</b> to select quality"
+        f"🎞 Choose <b>Video</b> (auto-fallback to best if qualities unavailable)"
     )
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -1302,8 +1302,12 @@ def cb_prepare_video_menu(call):
         try:
             entry["qualities"] = pick_video_qualities(entry.get("webpage_url") or entry.get("search_query") or "")
         except Exception as exc:
-            bot.answer_callback_query(call.id, f"No qualities: {str(exc)[:80]}", show_alert=True)
-            return
+            log.warning("quality extraction failed, using best fallback: %s", exc)
+            entry["qualities"] = []
+    if not entry.get("qualities"):
+        start_download_job(call.message.chat.id, entry, mode="video", quality=None)
+        bot.answer_callback_query(call.id, "No quality list from source. Downloading best compatible video.", show_alert=True)
+        return
     text, kb = render_video_quality_menu(sid, idx_int)
     safe_edit(call.message.chat.id, call.message.message_id, text, reply_markup=kb)
 
