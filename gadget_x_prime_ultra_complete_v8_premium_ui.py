@@ -38,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import imageio_ffmpeg
 import nest_asyncio
@@ -147,10 +148,12 @@ config_col.update_one({"_id": "global"}, {"$setOnInsert": DEFAULT_CONFIG}, upser
 # ---------------------------
 SEARCH_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_LOCK = threading.Lock()
+DIRECT_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlpool")
 ACTIVE_CHAT_JOBS: set[int] = set()
 ACTIVE_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
+URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 
 
 # ---------------------------
@@ -207,6 +210,60 @@ def cfg() -> Dict[str, Any]:
 
 def is_url(text: str) -> bool:
     return bool(URL_RE.match((text or "").strip()))
+
+
+def extract_first_url(text: str) -> str:
+    if not text:
+        return ""
+    match = URL_EXTRACT_RE.search(text.strip())
+    return (match.group(1) if match else "").strip()
+
+
+def prettify_extractor_name(name: str) -> str:
+    raw = (name or "Unknown").strip()
+    if not raw:
+        return "Unknown"
+    return raw.replace("_", " ").replace("IE", "").strip().title()
+
+
+def normalize_public_url(url: str) -> str:
+    """
+    Clean up copied social/share links so yt-dlp has a better chance to resolve
+    platform redirect/short URLs on the first try.
+    """
+    cleaned = (url or "").strip().replace("\u200b", "")
+    cleaned = cleaned.split()[0] if cleaned else ""
+    cleaned = cleaned.strip("<>\"'")
+
+    parsed = urlparse(cleaned)
+    host = (parsed.netloc or "").lower().lstrip("www.")
+    path = parsed.path or ""
+
+    # Convert /share/ links into canonical /reel/ links when possible.
+    if host.endswith("instagram.com") and "/share/" in path:
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == "share":
+            cleaned = f"https://instagram.com/reel/{parts[1]}/"
+            parsed = urlparse(cleaned)
+            host = (parsed.netloc or "").lower().lstrip("www.")
+
+    # Expand YouTube short links with v parameter when present.
+    if host == "youtu.be":
+        video_id = path.strip("/")
+        if video_id:
+            cleaned = f"https://www.youtube.com/watch?v={video_id}"
+            parsed = urlparse(cleaned)
+            host = (parsed.netloc or "").lower().lstrip("www.")
+
+    # For tiktok short links keep clean path only.
+    if host in ("vt.tiktok.com", "vm.tiktok.com"):
+        cleaned = f"{parsed.scheme}://{parsed.netloc}{path}"
+
+    # Remove tracking query for Instagram/Facebook style links.
+    # Keep query for some shorteners (e.g. YouTube list URLs).
+    if "instagram.com/" in cleaned or "facebook.com/" in cleaned or "tiktok.com/" in cleaned:
+        cleaned = cleaned.split("?", 1)[0]
+    return cleaned
 
 
 def format_duration(seconds: Optional[int]) -> str:
@@ -504,6 +561,27 @@ def cache_cleanup() -> None:
         to_del = [k for k, v in SEARCH_CACHE.items() if time.time() - v.get("created_at", time.time()) > 3600]
         for key in to_del:
             SEARCH_CACHE.pop(key, None)
+        direct_del = [k for k, v in DIRECT_INFO_CACHE.items() if time.time() - v.get("created_at", time.time()) > 900]
+        for key in direct_del:
+            DIRECT_INFO_CACHE.pop(key, None)
+
+
+def get_cached_direct_info(url: str) -> Optional[Dict[str, Any]]:
+    with CACHE_LOCK:
+        item = DIRECT_INFO_CACHE.get(url)
+        if item and time.time() - item.get("created_at", 0) <= 900:
+            return item.get("info")
+        if item:
+            DIRECT_INFO_CACHE.pop(url, None)
+    return None
+
+
+def put_cached_direct_info(url: str, info: Dict[str, Any]) -> None:
+    with CACHE_LOCK:
+        DIRECT_INFO_CACHE[url] = {
+            "created_at": time.time(),
+            "info": info,
+        }
 
 
 def acquire_chat_job(chat_id: int) -> bool:
@@ -572,18 +650,33 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
     if not info:
         raise RuntimeError("Unable to extract media info")
 
+    title = info.get("title") or "Untitled"
+    extractor_name = prettify_extractor_name(info.get("extractor_key") or info.get("extractor") or "Unknown")
+
     return {
-        "title": info.get("title") or "Untitled",
+        "title": title,
         "webpage_url": info.get("webpage_url") or url,
         "duration": info.get("duration"),
         "uploader": info.get("uploader") or info.get("channel") or "Unknown",
         "view_count": info.get("view_count"),
         "thumbnail": info.get("thumbnail"),
-        "extractor": info.get("extractor_key") or info.get("extractor") or "Unknown",
+        "extractor": extractor_name,
         "description": info.get("description") or "",
         "id": info.get("id") or "",
         "formats": info.get("formats") or [],
     }
+
+
+def process_search_query(chat_id: int, query: str):
+    status = bot.send_message(chat_id, "🔎 <i>Searching…</i>")
+    animate(chat_id, status.message_id, progress_frames("search"), 0.6)
+    results = search_media(query, limit=8)
+    if not results:
+        safe_edit(chat_id, status.message_id, "❌ No results found.", reply_markup=back_kb())
+        return
+    sid = cache_put({"type": "search", "query": query, "entries": results})
+    text, kb = render_search_results(sid)
+    safe_edit(chat_id, status.message_id, text, reply_markup=kb)
 
 
 def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
@@ -926,12 +1019,18 @@ def cmd_help(message):
         (
             "🆘 <b>Help</b>\n"
             "• /start — main menu\n"
+            "• /menu — open main menu\n"
             "• /cancel — clear current waiting state\n"
-            "• Send song name — when Search Music asks for it\n"
-            "• Send supported direct URL — when Download by Link asks for it\n"
+            "• Send song name — auto search works directly\n"
+            "• Send supported direct URL — bot also auto-detects links\n"
             "• Send audio/voice/video/document — for Shazam recognition"
         ),
     )
+
+
+@bot.message_handler(commands=["menu"])
+def cmd_menu(message):
+    cmd_start(message)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -1364,9 +1463,16 @@ def on_text(message):
 
     st = get_state(message.from_user.id).get("state", "")
     txt = (message.text or "").strip()
+    raw_url = extract_first_url(txt)
     if not txt:
         bot.reply_to(message, "ℹ️ Send text, a search query, or a URL.")
         return
+
+    # Advanced UX fallback:
+    # If user sends a direct URL without opening "Download by Link" first,
+    # process it automatically instead of forcing button flow.
+    if st != "await_direct_url" and is_url(raw_url):
+        st = "await_direct_url"
 
     if st == "await_redeem":
         if not cfg().get("feature_flags", {}).get("redeem", True):
@@ -1402,34 +1508,62 @@ def on_text(message):
         if not YTDLP_OK:
             bot.reply_to(message, "❌ yt-dlp not installed.")
             return
-        status = bot.reply_to(message, "🔎 <i>Searching…</i>")
-        animate(message.chat.id, status.message_id, progress_frames("search"), 0.6)
         try:
-            results = search_media(txt, limit=8)
-            if not results:
-                safe_edit(message.chat.id, status.message_id, "❌ No results found.", reply_markup=back_kb())
-                return
-            sid = cache_put({"type": "search", "query": txt, "entries": results})
-            text, kb = render_search_results(sid)
-            safe_edit(message.chat.id, status.message_id, text, reply_markup=kb)
+            process_search_query(message.chat.id, txt)
         except Exception as exc:
-            safe_edit(message.chat.id, status.message_id, f"❌ <b>Search failed</b>\n<code>{esc(str(exc)[:300])}</code>", reply_markup=back_kb())
+            bot.send_message(
+                message.chat.id,
+                f"❌ <b>Search failed</b>\n<code>{esc(str(exc)[:300])}</code>",
+                reply_markup=back_kb(),
+            )
         return
 
     if st == "await_direct_url":
-        clear_state(message.from_user.id)
-        if not is_url(txt):
+        normalized_url = normalize_public_url(raw_url or txt)
+        if not is_url(normalized_url):
             bot.reply_to(message, "❌ Please send a valid URL starting with http:// or https://")
             return
         status = bot.reply_to(message, "🌐 <i>Reading media info…</i>")
         animate(message.chat.id, status.message_id, progress_frames("search"), 0.6)
         try:
-            info = extract_direct_info(txt)
-            sid = cache_put({"type": "direct", "query": txt, "entries": [info]})
+            info = get_cached_direct_info(normalized_url) or extract_direct_info(normalized_url)
+            put_cached_direct_info(normalized_url, info)
+            clear_state(message.from_user.id)
+            sid = cache_put({"type": "direct", "query": normalized_url, "entries": [info]})
             text, kb = render_media_entry(sid, 0)
             safe_edit(message.chat.id, status.message_id, text, reply_markup=kb)
         except Exception as exc:
-            safe_edit(message.chat.id, status.message_id, f"❌ <b>Link processing failed</b>\n<code>{esc(str(exc)[:300])}</code>", reply_markup=back_kb())
+            safe_edit(
+                message.chat.id,
+                status.message_id,
+                (
+                    "❌ <b>Link processing failed</b>\n"
+                    f"<code>{esc(str(exc)[:260])}</code>\n\n"
+                    "Try:\n"
+                    "• Resend the final public post/video URL (not copied shortcut)\n"
+                    "• For Instagram/Facebook, open post in browser and copy full URL\n"
+                    "• If TikTok short link fails, open it once in browser and copy final URL\n"
+                    "• If private/age-locked, public access is required"
+                ),
+                reply_markup=back_kb(),
+            )
+        return
+
+    if not st and not raw_url and not txt.startswith("/"):
+        if len(txt) < 2:
+            bot.reply_to(message, "ℹ️ Please send a longer query.")
+            return
+        if not YTDLP_OK:
+            bot.reply_to(message, "❌ yt-dlp not installed.")
+            return
+        try:
+            process_search_query(message.chat.id, txt)
+        except Exception as exc:
+            bot.send_message(
+                message.chat.id,
+                f"❌ <b>Search failed</b>\n<code>{esc(str(exc)[:300])}</code>",
+                reply_markup=back_kb(),
+            )
         return
 
     if st == "adm_set_bonus" and is_admin(message.from_user.id):
@@ -1804,6 +1938,7 @@ def startup_check() -> None:
     try:
         bot.set_my_commands([
             BotCommand("start", "Open the ultra home menu"),
+            BotCommand("menu", "Open menu quickly"),
             BotCommand("help", "Show help"),
             BotCommand("cancel", "Cancel current input state"),
         ])
