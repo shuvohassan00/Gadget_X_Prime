@@ -1038,7 +1038,10 @@ def admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🎧 Toggle Audio", callback_data="adm_toggle_audio"),
         InlineKeyboardButton("🎞 Toggle Video", callback_data="adm_toggle_video"),
     )
-    kb.add(InlineKeyboardButton("🧪 System Health", callback_data="adm_health"))
+    kb.add(
+        InlineKeyboardButton("🧪 System Health", callback_data="adm_health"),
+        InlineKeyboardButton("🧹 Clear Queue", callback_data="adm_clear_queue"),
+    )
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return kb
 
@@ -1107,6 +1110,7 @@ def render_media_entry(search_id: str, idx: int) -> tuple[str, InlineKeyboardMar
         InlineKeyboardButton("🎧 Audio", callback_data=f"sa|{search_id}|{idx}"),
         InlineKeyboardButton("🎞 Video", callback_data=f"sv|{search_id}|{idx}"),
     )
+    kb.add(InlineKeyboardButton("⚡ Quick Video", callback_data=f"sqv|{search_id}|{idx}"))
     kb.add(InlineKeyboardButton("⬅️ Back to Results", callback_data=f"sb|{search_id}"))
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return txt, kb
@@ -1464,6 +1468,21 @@ def cb_download_audio_from_entry(call):
     bot.answer_callback_query(call.id, "Audio download started.")
 
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sqv|"))
+def cb_quick_video(call):
+    if not cfg().get("downloads_enabled", True) or not cfg().get("download_video_enabled", True):
+        bot.answer_callback_query(call.id, "Video download disabled.", show_alert=True)
+        return
+    _, sid, idx = call.data.split("|")
+    payload = cache_get(sid)
+    if not payload:
+        bot.answer_callback_query(call.id, "Session expired.", show_alert=True)
+        return
+    entry = payload["entries"][int(idx)]
+    start_download_job(call.message.chat.id, entry, mode="video", quality=None)
+    bot.answer_callback_query(call.id, "Quick video download started (best compatible).")
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("sv|"))
 def cb_prepare_video_menu(call):
     if not cfg().get("downloads_enabled", True) or not cfg().get("download_video_enabled", True):
@@ -1695,6 +1714,17 @@ def cb_adm_health(call):
     if not is_admin(call.from_user.id):
         return
     safe_edit(call.message.chat.id, call.message.message_id, system_health_report(), reply_markup=admin_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_clear_queue")
+def cb_adm_clear_queue(call):
+    if not is_admin(call.from_user.id):
+        return
+    with QUEUE_LOCK:
+        cleared = sum(QUEUED_CHAT_JOBS.values())
+        QUEUED_CHAT_JOBS.clear()
+    bot.answer_callback_query(call.id, f"Cleared queued jobs: {cleared}", show_alert=True)
+    cb_admin(call)
 
 
 # ---------------------------
@@ -2218,8 +2248,25 @@ def startup_check() -> None:
     cache_cleanup()
 
 
+def start_housekeeper() -> None:
+    def worker() -> None:
+        while True:
+            try:
+                cache_cleanup()
+                with QUEUE_LOCK:
+                    stale_chats = [cid for cid, q in QUEUED_CHAT_JOBS.items() if q <= 0]
+                    for cid in stale_chats:
+                        QUEUED_CHAT_JOBS.pop(cid, None)
+            except Exception as exc:
+                log.warning("housekeeper tick failed: %s", exc)
+            time.sleep(600)
+
+    threading.Thread(target=worker, name="housekeeper", daemon=True).start()
+
+
 def run_bot() -> None:
     startup_check()
+    start_housekeeper()
     try:
         bot.remove_webhook()
     except Exception:
