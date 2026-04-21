@@ -157,6 +157,8 @@ QUEUED_CHAT_JOBS: Dict[int, int] = {}
 QUEUE_LOCK = threading.Lock()
 ANIMATION_EVENTS: Dict[str, threading.Event] = {}
 ANIMATION_LOCK = threading.Lock()
+LAST_ACTION_AT: Dict[int, float] = {}
+RATE_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
 URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 TRAILING_URL_PUNCT_RE = re.compile(r"[)\],.!?:;]+$")
@@ -449,6 +451,10 @@ def ensure_user(message) -> None:
                 "referred_by": None,
                 "total_referrals": 0,
                 "claimed_milestones": [],
+                "settings": {
+                    "quick_video_default": False,
+                    "compact_mode": False,
+                },
             },
             "$set": {
                 "username": message.from_user.username or "",
@@ -462,6 +468,25 @@ def ensure_user(message) -> None:
 
 def get_user(user_id: int) -> Dict[str, Any]:
     return users_col.find_one({"user_id": user_id}) or {}
+
+
+def get_user_settings(user_id: int) -> Dict[str, Any]:
+    u = get_user(user_id)
+    st = u.get("settings") or {}
+    return {
+        "quick_video_default": bool(st.get("quick_video_default", False)),
+        "compact_mode": bool(st.get("compact_mode", False)),
+    }
+
+
+def allow_user_action(user_id: int, min_interval: float = 1.2) -> bool:
+    now_ts = time.time()
+    with RATE_LOCK:
+        last = LAST_ACTION_AT.get(user_id, 0.0)
+        if now_ts - last < min_interval:
+            return False
+        LAST_ACTION_AT[user_id] = now_ts
+        return True
 
 
 def is_admin(user_id: int) -> bool:
@@ -992,6 +1017,7 @@ def main_kb(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("👤 My Profile", callback_data="open_profile"),
         InlineKeyboardButton("👥 Invite & Earn", callback_data="open_referral"),
     )
+    kb.add(InlineKeyboardButton("⚙️ Settings", callback_data="open_settings"))
     kb.add(InlineKeyboardButton("💎 Premium Shop", callback_data="open_premium"))
     if is_admin(user_id):
         kb.add(InlineKeyboardButton("👨‍💻 Control Panel", callback_data="open_admin"))
@@ -1406,6 +1432,44 @@ def cb_tools(call):
     safe_edit(call.message.chat.id, call.message.message_id, txt, reply_markup=back_kb())
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "open_settings")
+def cb_open_settings(call):
+    st = get_user_settings(call.from_user.id)
+    txt = (
+        "⚙️ <b>Settings</b>\n"
+        f"• Quick Video default: <code>{'ON' if st['quick_video_default'] else 'OFF'}</code>\n"
+        f"• Compact mode: <code>{'ON' if st['compact_mode'] else 'OFF'}</code>\n\n"
+        "Use toggles below."
+    )
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⚡ Quick Video ON", callback_data="set_qv_on"),
+        InlineKeyboardButton("🎞 Quality First", callback_data="set_qv_off"),
+    )
+    kb.add(
+        InlineKeyboardButton("🧾 Compact ON", callback_data="set_compact_on"),
+        InlineKeyboardButton("📄 Compact OFF", callback_data="set_compact_off"),
+    )
+    kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
+    safe_edit(call.message.chat.id, call.message.message_id, txt, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("set_qv_on", "set_qv_off", "set_compact_on", "set_compact_off"))
+def cb_set_user_settings(call):
+    update: Dict[str, Any] = {}
+    if call.data == "set_qv_on":
+        update["settings.quick_video_default"] = True
+    elif call.data == "set_qv_off":
+        update["settings.quick_video_default"] = False
+    elif call.data == "set_compact_on":
+        update["settings.compact_mode"] = True
+    elif call.data == "set_compact_off":
+        update["settings.compact_mode"] = False
+    if update:
+        users_col.update_one({"user_id": call.from_user.id}, {"$set": update}, upsert=True)
+    cb_open_settings(call)
+
+
 @bot.callback_query_handler(func=lambda c: c.data == "open_search_music")
 def cb_open_search_music(call):
     set_state(call.from_user.id, "await_search_query")
@@ -1495,6 +1559,11 @@ def cb_prepare_video_menu(call):
         bot.answer_callback_query(call.id, "Session expired.", show_alert=True)
         return
     entry = payload["entries"][idx_int]
+    st = get_user_settings(call.from_user.id)
+    if st.get("quick_video_default"):
+        start_download_job(call.message.chat.id, entry, mode="video", quality=None)
+        bot.answer_callback_query(call.id, "Quick video mode is ON. Started best compatible download.")
+        return
     if not entry.get("qualities"):
         try:
             entry["qualities"] = pick_video_qualities(entry.get("webpage_url") or entry.get("search_query") or "")
@@ -1733,6 +1802,9 @@ def cb_adm_clear_queue(call):
 @bot.message_handler(content_types=["text"])
 def on_text(message):
     ensure_user(message)
+    if not allow_user_action(message.from_user.id):
+        bot.reply_to(message, "⏱ Please wait a moment before sending another request.")
+        return
     if not middleware_ok(message.chat.id, message.from_user.id):
         return
 
@@ -1978,6 +2050,9 @@ def on_text(message):
 @bot.message_handler(content_types=["audio", "voice", "video", "document"])
 def on_media(message):
     ensure_user(message)
+    if not allow_user_action(message.from_user.id):
+        bot.reply_to(message, "⏱ Please wait a moment before sending another file.")
+        return
     if not middleware_ok(message.chat.id, message.from_user.id):
         return
     if not cfg().get("feature_flags", {}).get("shazam", True):
