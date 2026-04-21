@@ -286,7 +286,10 @@ def expand_redirect_url(url: str) -> str:
         return candidate
     parsed = urlparse(candidate)
     host = (parsed.netloc or "").lower().lstrip("www.")
-    if host not in ("vt.tiktok.com", "vm.tiktok.com", "facebook.com", "m.facebook.com", "instagram.com"):
+    # Resolve only short-link hosts here.
+    # Expanding Facebook/Instagram links via plain urlopen often lands on
+    # login/checkpoint pages and hurts extractor success.
+    if host not in ("vt.tiktok.com", "vm.tiktok.com"):
         return candidate
     try:
         req = Request(
@@ -683,9 +686,9 @@ def yt_base_opts() -> Dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 60,
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 3,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
         "skip_unavailable_fragments": True,
         "ffmpeg_location": ffmpeg_path,
         "nocheckcertificate": True,
@@ -693,6 +696,16 @@ def yt_base_opts() -> Dict[str, Any]:
         "extract_flat": False,
         "http_chunk_size": 10485760,
     }
+
+
+def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int = 75) -> Dict[str, Any]:
+    def runner() -> Dict[str, Any]:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return resolve_ydl_entry(ydl.extract_info(source, download=download))
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ytdlp-timeout") as pool:
+        fut = pool.submit(runner)
+        return fut.result(timeout=timeout_sec)
 
 
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -739,8 +752,7 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
     expanded_url = expand_redirect_url(url)
     for opts in (primary_opts, fallback_opts):
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = resolve_ydl_entry(ydl.extract_info(expanded_url, download=False))
+            info = ytdlp_extract_with_timeout(expanded_url, opts, download=False, timeout_sec=70)
             if info:
                 break
         except Exception as exc:
@@ -845,8 +857,7 @@ def download_audio(source: str, work_dir: Path) -> Dict[str, Any]:
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = resolve_ydl_entry(ydl.extract_info(source, download=True))
+    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=220)
     files = sorted(work_dir.glob("audio.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp3"), None) or (files[0] if files else None)
     if not final_file:
@@ -876,8 +887,7 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = resolve_ydl_entry(ydl.extract_info(source, download=True))
+    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
