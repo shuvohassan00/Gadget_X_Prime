@@ -34,6 +34,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -159,6 +160,10 @@ ANIMATION_EVENTS: Dict[str, threading.Event] = {}
 ANIMATION_LOCK = threading.Lock()
 LAST_ACTION_AT: Dict[int, float] = {}
 RATE_LOCK = threading.Lock()
+ERROR_LOG: deque = deque(maxlen=80)
+ERROR_LOCK = threading.Lock()
+LAST_FAILED_JOB: Dict[int, Dict[str, Any]] = {}
+FAILED_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
 URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 TRAILING_URL_PUNCT_RE = re.compile(r"[)\],.!?:;]+$")
@@ -487,6 +492,24 @@ def allow_user_action(user_id: int, min_interval: float = 1.2) -> bool:
             return False
         LAST_ACTION_AT[user_id] = now_ts
         return True
+
+
+def remember_error(scope: str, details: str) -> None:
+    item = {"at": now_utc().strftime("%Y-%m-%d %H:%M:%S"), "scope": scope, "details": str(details)[:220]}
+    with ERROR_LOCK:
+        ERROR_LOG.appendleft(item)
+
+
+def render_recent_errors(limit: int = 10) -> str:
+    with ERROR_LOCK:
+        rows = list(ERROR_LOG)[:limit]
+    if not rows:
+        return "🧾 <b>Recent Errors</b>\nNo errors logged."
+    lines = ["🧾 <b>Recent Errors</b>"]
+    for i, row in enumerate(rows, 1):
+        lines.append(f"{i}. <code>{esc(row['at'])}</code> • <b>{esc(row['scope'])}</b>")
+        lines.append(f"   <code>{esc(row['details'])}</code>")
+    return "\n".join(lines)
 
 
 def is_admin(user_id: int) -> bool:
@@ -1067,6 +1090,10 @@ def admin_kb() -> InlineKeyboardMarkup:
     kb.add(
         InlineKeyboardButton("🧪 System Health", callback_data="adm_health"),
         InlineKeyboardButton("🧹 Clear Queue", callback_data="adm_clear_queue"),
+    )
+    kb.add(
+        InlineKeyboardButton("🧾 Recent Errors", callback_data="adm_recent_errors"),
+        InlineKeyboardButton("♻️ Retry Last Fail", callback_data="adm_retry_last"),
     )
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return kb
@@ -1796,6 +1823,26 @@ def cb_adm_clear_queue(call):
     cb_admin(call)
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "adm_recent_errors")
+def cb_adm_recent_errors(call):
+    if not is_admin(call.from_user.id):
+        return
+    safe_edit(call.message.chat.id, call.message.message_id, render_recent_errors(limit=12), reply_markup=admin_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_retry_last")
+def cb_adm_retry_last(call):
+    if not is_admin(call.from_user.id):
+        return
+    with FAILED_LOCK:
+        job = LAST_FAILED_JOB.get(call.message.chat.id)
+    if not job:
+        safe_answer_callback(call, "No failed job stored for this chat.", show_alert=True)
+        return
+    start_download_job(call.message.chat.id, job.get("entry", {}), mode=job.get("mode", "video"), quality=job.get("quality"))
+    safe_answer_callback(call, "Retry started for last failed job.")
+
+
 # ---------------------------
 # Text handler / states
 # ---------------------------
@@ -1883,6 +1930,7 @@ def on_text(message):
             text, kb = render_media_entry(sid, 0)
             safe_edit(message.chat.id, status.message_id, text, reply_markup=kb)
         except Exception as exc:
+            remember_error("link_extract", exc)
             safe_edit(
                 message.chat.id,
                 status.message_id,
@@ -2294,6 +2342,15 @@ def run_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any]
             safe_edit(chat_id, status_message_id, "✅ Download completed.", reply_markup=back_kb())
 
     except Exception as exc:
+        remember_error("download_job", exc)
+        with FAILED_LOCK:
+            LAST_FAILED_JOB[chat_id] = {
+                "entry": entry,
+                "mode": mode,
+                "quality": quality,
+                "failed_at": now_utc(),
+                "error": str(exc)[:240],
+            }
         safe_edit(chat_id, status_message_id, f"❌ <b>Download failed</b>\n<code>{esc(str(exc)[:400])}</code>", reply_markup=back_kb())
     finally:
         release_chat_job(chat_id)
