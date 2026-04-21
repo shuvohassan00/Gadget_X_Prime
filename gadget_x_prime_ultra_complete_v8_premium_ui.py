@@ -153,6 +153,8 @@ CACHE_LOCK = threading.Lock()
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlpool")
 ACTIVE_CHAT_JOBS: set[int] = set()
 ACTIVE_LOCK = threading.Lock()
+ANIMATION_EVENTS: Dict[str, threading.Event] = {}
+ANIMATION_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
 URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 TRAILING_URL_PUNCT_RE = re.compile(r"[)\],.!?:;]+$")
@@ -529,13 +531,27 @@ def progress_frames(kind: str) -> List[str]:
 
 
 def animate(chat_id: int, message_id: int, frames: List[str], delay: float = 0.7) -> None:
+    key = f"{chat_id}:{message_id}"
+    stop_event = threading.Event()
+    with ANIMATION_LOCK:
+        old_event = ANIMATION_EVENTS.get(key)
+        if old_event:
+            old_event.set()
+        ANIMATION_EVENTS[key] = stop_event
+
     def runner() -> None:
         for frame in frames:
+            if stop_event.is_set():
+                break
             try:
                 bot.edit_message_text(frame, chat_id, message_id)
                 time.sleep(delay)
             except Exception:
-                return
+                break
+        with ANIMATION_LOCK:
+            current = ANIMATION_EVENTS.get(key)
+            if current is stop_event:
+                ANIMATION_EVENTS.pop(key, None)
 
     if frames:
         threading.Thread(target=runner, daemon=True).start()
@@ -568,6 +584,12 @@ def send_home_message(chat_id: int, user_id: int, old_message_id: Optional[int] 
 
 
 def safe_edit(chat_id: int, message_id: int, text: str, reply_markup=None) -> None:
+    key = f"{chat_id}:{message_id}"
+    with ANIMATION_LOCK:
+        event = ANIMATION_EVENTS.pop(key, None)
+    if event:
+        event.set()
+
     try:
         bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
         return
