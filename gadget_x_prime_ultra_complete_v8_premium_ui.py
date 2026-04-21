@@ -660,6 +660,40 @@ def get_stats() -> Dict[str, int]:
     }
 
 
+def system_health_report() -> str:
+    mongo_ok = "✅"
+    try:
+        client.admin.command("ping")
+    except Exception:
+        mongo_ok = "❌"
+
+    ffmpeg_ok = "✅" if Path(ffmpeg_path).exists() else "❌"
+    ytdlp_ok = "✅" if YTDLP_OK else "❌"
+    shazam_ok = "✅" if SHAZAM_OK else "❌"
+    ytdlp_ver = "unknown"
+    if YTDLP_OK:
+        try:
+            ytdlp_ver = getattr(getattr(yt_dlp, "version", object()), "__version__", "unknown")
+        except Exception:
+            ytdlp_ver = "unknown"
+
+    with ACTIVE_LOCK:
+        active_jobs = len(ACTIVE_CHAT_JOBS)
+    with CACHE_LOCK:
+        cache_items = len(SEARCH_CACHE)
+
+    return (
+        "🧪 <b>System Health</b>\n"
+        f"• MongoDB: {mongo_ok}\n"
+        f"• yt-dlp: {ytdlp_ok} (<code>{esc(ytdlp_ver)}</code>)\n"
+        f"• ffmpeg: {ffmpeg_ok}\n"
+        f"• Shazam: {shazam_ok}\n"
+        f"• Active downloads: <code>{active_jobs}</code>\n"
+        f"• Cache sessions: <code>{cache_items}</code>\n"
+        f"• Upload limit: <code>{upload_limit_text()}</code>"
+    )
+
+
 def cache_put(payload: Dict[str, Any]) -> str:
     cid = uuid.uuid4().hex[:8]
     payload["created_at"] = time.time()
@@ -980,6 +1014,11 @@ def admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🎵 Toggle Shazam", callback_data="adm_toggle_shazam"),
         InlineKeyboardButton("📥 Toggle Downloads", callback_data="adm_toggle_downloads"),
     )
+    kb.add(
+        InlineKeyboardButton("🎧 Toggle Audio", callback_data="adm_toggle_audio"),
+        InlineKeyboardButton("🎞 Toggle Video", callback_data="adm_toggle_video"),
+    )
+    kb.add(InlineKeyboardButton("🧪 System Health", callback_data="adm_health"))
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return kb
 
@@ -1153,6 +1192,17 @@ def cmd_cancel(message):
     clear_state(message.from_user.id)
     bot.reply_to(message, "❌ Cancelled.")
     bot.send_message(message.chat.id, home_text(message.from_user.id), reply_markup=main_kb(message.from_user.id))
+
+
+@bot.message_handler(commands=["health"])
+def cmd_health(message):
+    ensure_user(message)
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Admin only.")
+        return
+    if not middleware_ok(message.chat.id, message.from_user.id):
+        return
+    bot.reply_to(message, system_health_report())
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_home")
@@ -1437,7 +1487,16 @@ def cb_admin(call):
     if not is_admin(call.from_user.id):
         safe_answer_callback(call, "Admin only", show_alert=True)
         return
-    safe_edit(call.message.chat.id, call.message.message_id, "👨‍💻 <b>Admin Panel</b>", reply_markup=admin_kb())
+    c = cfg()
+    txt = (
+        "👨‍💻 <b>Admin Panel</b>\n"
+        f"Downloads: <code>{'ON' if c.get('downloads_enabled', True) else 'OFF'}</code>\n"
+        f"Audio DL: <code>{'ON' if c.get('download_audio_enabled', True) else 'OFF'}</code>\n"
+        f"Video DL: <code>{'ON' if c.get('download_video_enabled', True) else 'OFF'}</code>\n"
+        f"Shazam: <code>{'ON' if c.get('feature_flags', {}).get('shazam', True) else 'OFF'}</code>\n"
+        f"Maintenance: <code>{'ON' if c.get('maintenance_mode', False) else 'OFF'}</code>"
+    )
+    safe_edit(call.message.chat.id, call.message.message_id, txt, reply_markup=admin_kb())
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "adm_stats")
@@ -1569,6 +1628,33 @@ def cb_adm_toggle_downloads(call):
     config_col.update_one({"_id": "global"}, {"$set": {"downloads_enabled": not current}})
     bot.answer_callback_query(call.id, f"Downloads set to {not current}", show_alert=True)
     cb_admin(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_toggle_audio")
+def cb_adm_toggle_audio(call):
+    if not is_admin(call.from_user.id):
+        return
+    current = bool(cfg().get("download_audio_enabled", True))
+    config_col.update_one({"_id": "global"}, {"$set": {"download_audio_enabled": not current}})
+    bot.answer_callback_query(call.id, f"Audio download set to {not current}", show_alert=True)
+    cb_admin(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_toggle_video")
+def cb_adm_toggle_video(call):
+    if not is_admin(call.from_user.id):
+        return
+    current = bool(cfg().get("download_video_enabled", True))
+    config_col.update_one({"_id": "global"}, {"$set": {"download_video_enabled": not current}})
+    bot.answer_callback_query(call.id, f"Video download set to {not current}", show_alert=True)
+    cb_admin(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_health")
+def cb_adm_health(call):
+    if not is_admin(call.from_user.id):
+        return
+    safe_edit(call.message.chat.id, call.message.message_id, system_health_report(), reply_markup=admin_kb())
 
 
 # ---------------------------
@@ -2058,6 +2144,7 @@ def startup_check() -> None:
             BotCommand("start", "Open the ultra home menu"),
             BotCommand("help", "Show help"),
             BotCommand("cancel", "Cancel current input state"),
+            BotCommand("health", "Admin system health report"),
         ])
     except Exception as exc:
         log.warning("set_my_commands failed: %s", exc)
