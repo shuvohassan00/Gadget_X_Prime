@@ -153,6 +153,8 @@ CACHE_LOCK = threading.Lock()
 DOWNLOAD_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlpool")
 ACTIVE_CHAT_JOBS: set[int] = set()
 ACTIVE_LOCK = threading.Lock()
+QUEUED_CHAT_JOBS: Dict[int, int] = {}
+QUEUE_LOCK = threading.Lock()
 ANIMATION_EVENTS: Dict[str, threading.Event] = {}
 ANIMATION_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
@@ -679,6 +681,8 @@ def system_health_report() -> str:
 
     with ACTIVE_LOCK:
         active_jobs = len(ACTIVE_CHAT_JOBS)
+    with QUEUE_LOCK:
+        queued_jobs = sum(QUEUED_CHAT_JOBS.values())
     with CACHE_LOCK:
         cache_items = len(SEARCH_CACHE)
 
@@ -689,6 +693,7 @@ def system_health_report() -> str:
         f"• ffmpeg: {ffmpeg_ok}\n"
         f"• Shazam: {shazam_ok}\n"
         f"• Active downloads: <code>{active_jobs}</code>\n"
+        f"• Queued downloads: <code>{queued_jobs}</code>\n"
         f"• Cache sessions: <code>{cache_items}</code>\n"
         f"• Upload limit: <code>{upload_limit_text()}</code>"
     )
@@ -730,6 +735,21 @@ def acquire_chat_job(chat_id: int) -> bool:
 def release_chat_job(chat_id: int) -> None:
     with ACTIVE_LOCK:
         ACTIVE_CHAT_JOBS.discard(chat_id)
+
+
+def enqueue_chat_job(chat_id: int) -> int:
+    with QUEUE_LOCK:
+        QUEUED_CHAT_JOBS[chat_id] = QUEUED_CHAT_JOBS.get(chat_id, 0) + 1
+        return QUEUED_CHAT_JOBS[chat_id]
+
+
+def dequeue_chat_job(chat_id: int) -> None:
+    with QUEUE_LOCK:
+        current = QUEUED_CHAT_JOBS.get(chat_id, 0)
+        if current <= 1:
+            QUEUED_CHAT_JOBS.pop(chat_id, None)
+        else:
+            QUEUED_CHAT_JOBS[chat_id] = current - 1
 
 
 # ---------------------------
@@ -1180,6 +1200,7 @@ def cmd_help(message):
             "🆘 <b>Help</b>\n"
             "• /start — main menu\n"
             "• /cancel — clear current waiting state\n"
+            "• /status — view current download queue status\n"
             "• Send song name — when Search Music asks for it\n"
             "• Send supported direct URL — bot also auto-detects links\n"
             "• Send audio/voice/video/document — for Shazam recognition"
@@ -1203,6 +1224,25 @@ def cmd_health(message):
     if not middleware_ok(message.chat.id, message.from_user.id):
         return
     bot.reply_to(message, system_health_report())
+
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    ensure_user(message)
+    if not middleware_ok(message.chat.id, message.from_user.id):
+        return
+    with ACTIVE_LOCK:
+        active = message.chat.id in ACTIVE_CHAT_JOBS
+    with QUEUE_LOCK:
+        queued = QUEUED_CHAT_JOBS.get(message.chat.id, 0)
+    txt = (
+        "📌 <b>Bot Status</b>\n"
+        f"• Active download in this chat: <code>{'YES' if active else 'NO'}</code>\n"
+        f"• Queued jobs in this chat: <code>{queued}</code>\n"
+        f"• Upload limit: <code>{upload_limit_text()}</code>\n"
+        f"• Downloads feature: <code>{'ON' if cfg().get('downloads_enabled', True) else 'OFF'}</code>"
+    )
+    bot.reply_to(message, txt)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_home")
@@ -2022,11 +2062,32 @@ def on_media(message):
 # ---------------------------
 def start_download_job(chat_id: int, entry: Dict[str, Any], mode: str, quality: Optional[Dict[str, Any]] = None) -> None:
     if not acquire_chat_job(chat_id):
-        bot.send_message(chat_id, "⏳ Another download is already running in this chat. Wait for it to finish.")
+        position = enqueue_chat_job(chat_id)
+        wait_msg = bot.send_message(chat_id, f"⏳ Another download is running.\nYour job is queued: <b>#{position}</b>")
+        DOWNLOAD_POOL.submit(run_queued_download_job, chat_id, wait_msg.message_id, entry, mode, quality)
         return
 
     status = bot.send_message(chat_id, "📥 <i>Preparing download job…</i>")
     DOWNLOAD_POOL.submit(run_download_job, chat_id, status.message_id, entry, mode, quality)
+
+
+def run_queued_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any], mode: str, quality: Optional[Dict[str, Any]] = None) -> None:
+    max_wait_sec = 420
+    started = False
+    start_time = time.time()
+    try:
+        while time.time() - start_time < max_wait_sec:
+            if acquire_chat_job(chat_id):
+                started = True
+                break
+            time.sleep(1.0)
+        if not started:
+            safe_edit(chat_id, status_message_id, "❌ <b>Queue timeout.</b>\nPlease retry download.", reply_markup=back_kb())
+            return
+        safe_edit(chat_id, status_message_id, "📥 <i>Queue cleared. Starting your download…</i>")
+        run_download_job(chat_id, status_message_id, entry, mode, quality)
+    finally:
+        dequeue_chat_job(chat_id)
 
 
 def run_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any], mode: str, quality: Optional[Dict[str, Any]] = None) -> None:
@@ -2144,6 +2205,7 @@ def startup_check() -> None:
             BotCommand("start", "Open the ultra home menu"),
             BotCommand("help", "Show help"),
             BotCommand("cancel", "Cancel current input state"),
+            BotCommand("status", "Show chat download status"),
             BotCommand("health", "Admin system health report"),
         ])
     except Exception as exc:
