@@ -166,6 +166,11 @@ LAST_FAILED_JOB: Dict[int, Dict[str, Any]] = {}
 FAILED_LOCK = threading.Lock()
 PLATFORM_FAIL_COUNTS: Dict[str, int] = {}
 PLATFORM_LOCK = threading.Lock()
+PLATFORM_FAIL_EVENTS: Dict[str, deque] = {}
+PLATFORM_PROTECT_UNTIL: Dict[str, datetime] = {}
+PROTECT_FAIL_WINDOW_SEC = 900
+PROTECT_FAIL_THRESHOLD = 6
+PROTECT_DURATION_SEC = 600
 URL_RE = re.compile(r"^https?://", re.I)
 URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 TRAILING_URL_PUNCT_RE = re.compile(r"[)\],.!?:;]+$")
@@ -529,8 +534,18 @@ def detect_platform(source: str) -> str:
 
 def add_platform_failure(source: str) -> None:
     platform = detect_platform(source)
+    now_dt = now_utc()
     with PLATFORM_LOCK:
         PLATFORM_FAIL_COUNTS[platform] = PLATFORM_FAIL_COUNTS.get(platform, 0) + 1
+        q = PLATFORM_FAIL_EVENTS.get(platform)
+        if q is None:
+            q = deque()
+            PLATFORM_FAIL_EVENTS[platform] = q
+        q.append(now_dt)
+        while q and (now_dt - q[0]).total_seconds() > PROTECT_FAIL_WINDOW_SEC:
+            q.popleft()
+        if len(q) >= PROTECT_FAIL_THRESHOLD:
+            PLATFORM_PROTECT_UNTIL[platform] = now_dt + timedelta(seconds=PROTECT_DURATION_SEC)
 
 
 def render_platform_fail_stats() -> str:
@@ -541,7 +556,23 @@ def render_platform_fail_stats() -> str:
     lines = ["📉 <b>Platform Failure Stats</b>"]
     for name, cnt in items[:8]:
         lines.append(f"• {esc(name)}: <code>{cnt}</code>")
+        until = PLATFORM_PROTECT_UNTIL.get(name)
+        if until and until > now_utc():
+            rem = int((until - now_utc()).total_seconds() // 60)
+            lines.append(f"   🛡 protected for ~{rem} min")
     return "\n".join(lines)
+
+
+def get_platform_protect_status(source: str) -> tuple[bool, str, int]:
+    platform = detect_platform(source)
+    with PLATFORM_LOCK:
+        until = PLATFORM_PROTECT_UNTIL.get(platform)
+    if not until:
+        return False, platform, 0
+    rem = int((until - now_utc()).total_seconds())
+    if rem <= 0:
+        return False, platform, 0
+    return True, platform, rem
 
 
 def is_admin(user_id: int) -> bool:
@@ -1127,7 +1158,10 @@ def admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🧾 Recent Errors", callback_data="adm_recent_errors"),
         InlineKeyboardButton("♻️ Retry Last Fail", callback_data="adm_retry_last"),
     )
-    kb.add(InlineKeyboardButton("📉 Platform Fail Stats", callback_data="adm_fail_stats"))
+    kb.add(
+        InlineKeyboardButton("📉 Platform Fail Stats", callback_data="adm_fail_stats"),
+        InlineKeyboardButton("🛡 Protect Status", callback_data="adm_protect_status"),
+    )
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return kb
 
@@ -1883,6 +1917,22 @@ def cb_adm_fail_stats(call):
     safe_edit(call.message.chat.id, call.message.message_id, render_platform_fail_stats(), reply_markup=admin_kb())
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "adm_protect_status")
+def cb_adm_protect_status(call):
+    if not is_admin(call.from_user.id):
+        return
+    lines = ["🛡 <b>Auto-Protect Status</b>"]
+    with PLATFORM_LOCK:
+        active = {k: v for k, v in PLATFORM_PROTECT_UNTIL.items() if v > now_utc()}
+    if not active:
+        lines.append("No active platform protection.")
+    else:
+        for name, until in sorted(active.items(), key=lambda kv: kv[1], reverse=True):
+            rem = int((until - now_utc()).total_seconds() // 60)
+            lines.append(f"• {esc(name)}: <code>{rem} min</code> remaining")
+    safe_edit(call.message.chat.id, call.message.message_id, "\n".join(lines), reply_markup=admin_kb())
+
+
 # ---------------------------
 # Text handler / states
 # ---------------------------
@@ -1960,6 +2010,14 @@ def on_text(message):
         normalized_url = normalize_public_url(raw_url or txt)
         if not is_url(normalized_url):
             bot.reply_to(message, "❌ Please send a valid URL starting with http:// or https://")
+            return
+        protected, platform, rem_sec = get_platform_protect_status(normalized_url)
+        if protected:
+            bot.reply_to(
+                message,
+                f"🛡 {platform} downloads are temporarily protected due to repeated failures.\n"
+                f"Try again in about {max(1, rem_sec // 60)} minutes or use another platform link.",
+            )
             return
         status = bot.reply_to(message, "🌐 <i>Reading media info…</i>")
         animate(message.chat.id, status.message_id, progress_frames("search"), 0.6)
