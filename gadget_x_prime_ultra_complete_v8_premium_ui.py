@@ -164,6 +164,8 @@ ERROR_LOG: deque = deque(maxlen=80)
 ERROR_LOCK = threading.Lock()
 LAST_FAILED_JOB: Dict[int, Dict[str, Any]] = {}
 FAILED_LOCK = threading.Lock()
+PLATFORM_FAIL_COUNTS: Dict[str, int] = {}
+PLATFORM_LOCK = threading.Lock()
 URL_RE = re.compile(r"^https?://", re.I)
 URL_EXTRACT_RE = re.compile(r"(https?://[^\s<>\"']+)", re.I)
 TRAILING_URL_PUNCT_RE = re.compile(r"[)\],.!?:;]+$")
@@ -509,6 +511,36 @@ def render_recent_errors(limit: int = 10) -> str:
     for i, row in enumerate(rows, 1):
         lines.append(f"{i}. <code>{esc(row['at'])}</code> • <b>{esc(row['scope'])}</b>")
         lines.append(f"   <code>{esc(row['details'])}</code>")
+    return "\n".join(lines)
+
+
+def detect_platform(source: str) -> str:
+    s = (source or "").lower()
+    if "youtube.com" in s or "youtu.be" in s:
+        return "YouTube"
+    if "facebook.com" in s or "fb.watch" in s:
+        return "Facebook"
+    if "instagram.com" in s:
+        return "Instagram"
+    if "tiktok.com" in s:
+        return "TikTok"
+    return "Other"
+
+
+def add_platform_failure(source: str) -> None:
+    platform = detect_platform(source)
+    with PLATFORM_LOCK:
+        PLATFORM_FAIL_COUNTS[platform] = PLATFORM_FAIL_COUNTS.get(platform, 0) + 1
+
+
+def render_platform_fail_stats() -> str:
+    with PLATFORM_LOCK:
+        items = sorted(PLATFORM_FAIL_COUNTS.items(), key=lambda kv: kv[1], reverse=True)
+    if not items:
+        return "📉 <b>Platform Failure Stats</b>\nNo failures logged yet."
+    lines = ["📉 <b>Platform Failure Stats</b>"]
+    for name, cnt in items[:8]:
+        lines.append(f"• {esc(name)}: <code>{cnt}</code>")
     return "\n".join(lines)
 
 
@@ -1095,6 +1127,7 @@ def admin_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🧾 Recent Errors", callback_data="adm_recent_errors"),
         InlineKeyboardButton("♻️ Retry Last Fail", callback_data="adm_retry_last"),
     )
+    kb.add(InlineKeyboardButton("📉 Platform Fail Stats", callback_data="adm_fail_stats"))
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return kb
 
@@ -1843,6 +1876,13 @@ def cb_adm_retry_last(call):
     safe_answer_callback(call, "Retry started for last failed job.")
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "adm_fail_stats")
+def cb_adm_fail_stats(call):
+    if not is_admin(call.from_user.id):
+        return
+    safe_edit(call.message.chat.id, call.message.message_id, render_platform_fail_stats(), reply_markup=admin_kb())
+
+
 # ---------------------------
 # Text handler / states
 # ---------------------------
@@ -2343,6 +2383,7 @@ def run_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any]
 
     except Exception as exc:
         remember_error("download_job", exc)
+        add_platform_failure(entry.get("webpage_url") or entry.get("search_query") or entry.get("title") or "")
         with FAILED_LOCK:
             LAST_FAILED_JOB[chat_id] = {
                 "entry": entry,
