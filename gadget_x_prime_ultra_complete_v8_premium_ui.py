@@ -356,6 +356,62 @@ def upload_limit_text() -> str:
     return f"{MAX_TELEGRAM_UPLOAD_MB} MB"
 
 
+def compress_media_to_limit(input_path: Path, output_path: Path, target_mb: int, mode: str = "video") -> Optional[Path]:
+    """
+    Try to compress media to stay under Telegram upload limit.
+    Returns output path on success, otherwise None.
+    """
+    if not input_path.exists():
+        return None
+    target_bytes = max(5 * 1024 * 1024, int(target_mb * 1024 * 1024 * 0.92))
+    duration_probe = 120
+    if mode == "audio":
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            "-b:a",
+            "128k",
+            str(output_path),
+        ]
+    else:
+        bitrate_k = max(250, int((target_bytes * 8) / max(duration_probe, 1) / 1000))
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(input_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-b:v",
+            f"{bitrate_k}k",
+            "-maxrate",
+            f"{int(bitrate_k * 1.2)}k",
+            "-bufsize",
+            f"{int(bitrate_k * 2)}k",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=420, check=False)
+        if output_path.exists() and output_path.stat().st_size <= upload_limit_bytes():
+            return output_path
+    except Exception:
+        return None
+    return None
+
+
 def short_title(text: str, limit: int = 40) -> str:
     text = (text or "").strip().replace("\n", " ")
     if len(text) <= limit:
@@ -1874,9 +1930,15 @@ def run_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any]
             file_path: Path = result["path"]
             size = file_path.stat().st_size if file_path.exists() else None
             if is_over_upload_limit(size):
-                raise RuntimeError(
-                    f"Audio file is too large for bot upload. File size: {format_bytes(size)}. Please try a shorter track or smaller source. Safe limit: {upload_limit_text()}."
-                )
+                safe_edit(chat_id, status_message_id, "🛠 <i>Audio too large, compressing…</i>")
+                compressed = compress_media_to_limit(file_path, work_dir / "audio_compressed.mp3", MAX_TELEGRAM_UPLOAD_MB, mode="audio")
+                if compressed:
+                    file_path = compressed
+                    size = file_path.stat().st_size
+                else:
+                    raise RuntimeError(
+                        f"Audio file is too large for bot upload. File size: {format_bytes(size)}. Safe limit: {upload_limit_text()}."
+                    )
             caption = (
                 f"🎧 <b>{esc(info.get('title') or entry.get('title') or 'Audio')}</b>\n"
                 f"👤 Uploader: <code>{esc(info.get('uploader') or info.get('channel') or entry.get('uploader') or 'Unknown')}</code>\n"
@@ -1910,9 +1972,16 @@ def run_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any]
             file_path = result["path"]
             size = file_path.stat().st_size if file_path.exists() else None
             if is_over_upload_limit(size):
-                raise RuntimeError(
-                    f"Selected video is too large for bot upload. Quality: {label}. File size: {format_bytes(size)}. Please choose a smaller quality under {upload_limit_text()}."
-                )
+                safe_edit(chat_id, status_message_id, "🛠 <i>Video too large, compressing for Telegram…</i>")
+                compressed = compress_media_to_limit(file_path, work_dir / "video_compressed.mp4", MAX_TELEGRAM_UPLOAD_MB, mode="video")
+                if compressed:
+                    file_path = compressed
+                    size = file_path.stat().st_size
+                    label = f"{label} • compressed"
+                else:
+                    raise RuntimeError(
+                        f"Selected video is too large for bot upload. Quality: {label}. File size: {format_bytes(size)}. Please choose a smaller quality under {upload_limit_text()}."
+                    )
             caption = (
                 f"🎞 <b>{esc(info.get('title') or entry.get('title') or 'Video')}</b>\n"
                 f"👤 Uploader: <code>{esc(info.get('uploader') or info.get('channel') or entry.get('uploader') or 'Unknown')}</code>\n"
