@@ -61,6 +61,8 @@ BOT_NAME = os.getenv("BOT_NAME", "GADGET X-PRIME 2026 ULTRA").strip()
 TMP_DIR = Path(os.getenv("BOT_TMP_DIR", "./tmp_gadget_ultra")).resolve()
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 MAX_TELEGRAM_UPLOAD_MB = max(1, int(os.getenv("MAX_TELEGRAM_UPLOAD_MB", "45").strip() or 45))
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing in .env")
@@ -588,7 +590,7 @@ def release_chat_job(chat_id: int) -> None:
 # yt-dlp helpers
 # ---------------------------
 def yt_base_opts() -> Dict[str, Any]:
-    return {
+    opts: Dict[str, Any] = {
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
@@ -599,6 +601,34 @@ def yt_base_opts() -> Dict[str, Any]:
         "geo_bypass": True,
         "extract_flat": False,
     }
+    cookies_file = Path(YTDLP_COOKIES_FILE).expanduser() if YTDLP_COOKIES_FILE else None
+    if cookies_file and cookies_file.exists():
+        opts["cookiefile"] = str(cookies_file)
+
+    # Supported format:
+    #   firefox
+    #   chrome:Profile 1
+    if YTDLP_COOKIES_FROM_BROWSER:
+        browser_cfg = YTDLP_COOKIES_FROM_BROWSER.split(":", 1)
+        browser_name = browser_cfg[0].strip().lower()
+        browser_profile = browser_cfg[1].strip() if len(browser_cfg) == 2 else ""
+        if browser_name:
+            opts["cookiesfrombrowser"] = (browser_name, None, None, browser_profile or None)
+    return opts
+
+
+def normalize_yt_dlp_error(exc: Exception) -> str:
+    msg = str(exc or "").strip()
+    lowered = msg.lower()
+    if "sign in to confirm you’re not a bot" in lowered or "sign in to confirm you're not a bot" in lowered:
+        return (
+            "YouTube blocked anonymous access for this link. "
+            "Set YTDLP_COOKIES_FILE with exported cookies.txt or set "
+            "YTDLP_COOKIES_FROM_BROWSER (example: chrome or firefox)."
+        )
+    if "private video" in lowered or "members-only" in lowered or "age-restricted" in lowered:
+        return "This media requires a signed-in account (private/members-only/age-restricted)."
+    return msg or "Unknown yt-dlp error"
 
 
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -653,7 +683,7 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
 
     if not info:
         if last_exc:
-            raise RuntimeError(f"Unable to extract media info: {last_exc}")
+            raise RuntimeError(f"Unable to extract media info: {normalize_yt_dlp_error(last_exc)}")
         raise RuntimeError("Unable to extract media info")
 
     title = info.get("title") or "Untitled"
@@ -1898,7 +1928,8 @@ def run_download_job(chat_id: int, status_message_id: int, entry: Dict[str, Any]
             safe_edit(chat_id, status_message_id, "✅ Download completed.", reply_markup=back_kb())
 
     except Exception as exc:
-        safe_edit(chat_id, status_message_id, f"❌ <b>Download failed</b>\n<code>{esc(str(exc)[:400])}</code>", reply_markup=back_kb())
+        err_text = normalize_yt_dlp_error(exc)
+        safe_edit(chat_id, status_message_id, f"❌ <b>Download failed</b>\n<code>{esc(err_text[:400])}</code>", reply_markup=back_kb())
     finally:
         release_chat_job(chat_id)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1921,6 +1952,10 @@ def startup_check() -> None:
     log.info("✅ ffmpeg detected at %s", ffmpeg_path)
     log.info("✅ safe upload limit set to %s", upload_limit_text())
     log.info("✅ yt-dlp available: %s", YTDLP_OK)
+    if YTDLP_COOKIES_FILE:
+        log.info("🍪 yt-dlp cookie file configured: %s", Path(YTDLP_COOKIES_FILE).expanduser())
+    if YTDLP_COOKIES_FROM_BROWSER:
+        log.info("🍪 yt-dlp browser-cookie mode configured: %s", YTDLP_COOKIES_FROM_BROWSER)
     log.info("✅ shazamio available: %s", SHAZAM_OK)
     cache_cleanup()
 
