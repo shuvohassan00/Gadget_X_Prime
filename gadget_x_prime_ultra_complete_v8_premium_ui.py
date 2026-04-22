@@ -64,6 +64,8 @@ BOT_NAME = os.getenv("BOT_NAME", "GADGET X-PRIME 2026 ULTRA").strip()
 TMP_DIR = Path(os.getenv("BOT_TMP_DIR", "./tmp_gadget_ultra")).resolve()
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 MAX_TELEGRAM_UPLOAD_MB = max(1, int(os.getenv("MAX_TELEGRAM_UPLOAD_MB", "45").strip() or 45))
+YTDLP_COOKIE_FILE = os.getenv("YTDLP_COOKIE_FILE", "").strip()
+YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip().lower()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing in .env")
@@ -795,6 +797,11 @@ def system_health_report() -> str:
     ytdlp_ok = "✅" if YTDLP_OK else "❌"
     shazam_ok = "✅" if SHAZAM_OK else "❌"
     ytdlp_ver = "unknown"
+    cookie_mode = "none"
+    if YTDLP_COOKIE_FILE:
+        cookie_mode = f"file:{YTDLP_COOKIE_FILE}"
+    elif YTDLP_COOKIES_FROM_BROWSER:
+        cookie_mode = f"browser:{YTDLP_COOKIES_FROM_BROWSER}"
     if YTDLP_OK:
         try:
             ytdlp_ver = getattr(getattr(yt_dlp, "version", object()), "__version__", "unknown")
@@ -812,6 +819,7 @@ def system_health_report() -> str:
         "🧪 <b>System Health</b>\n"
         f"• MongoDB: {mongo_ok}\n"
         f"• yt-dlp: {ytdlp_ok} (<code>{esc(ytdlp_ver)}</code>)\n"
+        f"• yt-dlp cookies: <code>{esc(cookie_mode)}</code>\n"
         f"• ffmpeg: {ffmpeg_ok}\n"
         f"• Shazam: {shazam_ok}\n"
         f"• Active downloads: <code>{active_jobs}</code>\n"
@@ -878,7 +886,7 @@ def dequeue_chat_job(chat_id: int) -> None:
 # yt-dlp helpers
 # ---------------------------
 def yt_base_opts() -> Dict[str, Any]:
-    return {
+    opts = {
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
@@ -894,6 +902,14 @@ def yt_base_opts() -> Dict[str, Any]:
         "extract_flat": False,
         "http_chunk_size": 10485760,
     }
+    if YTDLP_COOKIE_FILE:
+        cookie_path = Path(YTDLP_COOKIE_FILE).expanduser()
+        if cookie_path.exists():
+            opts["cookiefile"] = str(cookie_path)
+    elif YTDLP_COOKIES_FROM_BROWSER:
+        # Supported values: chrome, chromium, firefox, edge, brave, opera, vivaldi, safari
+        opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER,)
+    return opts
 
 
 def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int = 75) -> Dict[str, Any]:
@@ -2095,6 +2111,13 @@ def on_text(message):
             safe_edit(message.chat.id, status.message_id, text, reply_markup=kb)
         except Exception as exc:
             remember_error("link_extract", exc)
+            msg = str(exc).lower()
+            extra_tip = ""
+            if "sign in to confirm you’re not a bot" in msg or "sign in to confirm you're not a bot" in msg:
+                extra_tip = (
+                    "\n• YouTube anti-bot block detected: set YTDLP_COOKIE_FILE "
+                    "or YTDLP_COOKIES_FROM_BROWSER in environment"
+                )
             safe_edit(
                 message.chat.id,
                 status.message_id,
@@ -2106,6 +2129,7 @@ def on_text(message):
                     "• For Instagram/Facebook, open post in browser and copy full URL\n"
                     "• If TikTok short link fails, open it once in browser and copy final URL\n"
                     "• If private/age-locked, public access is required"
+                    f"{extra_tip}"
                 ),
                 reply_markup=back_kb(),
             )
@@ -2541,6 +2565,12 @@ def startup_check() -> None:
     log.info("✅ ffmpeg detected at %s", ffmpeg_path)
     log.info("✅ safe upload limit set to %s", upload_limit_text())
     log.info("✅ yt-dlp available: %s", YTDLP_OK)
+    if YTDLP_COOKIE_FILE:
+        log.info("✅ yt-dlp cookie file configured: %s", YTDLP_COOKIE_FILE)
+    elif YTDLP_COOKIES_FROM_BROWSER:
+        log.info("✅ yt-dlp cookies-from-browser configured: %s", YTDLP_COOKIES_FROM_BROWSER)
+    else:
+        log.info("ℹ️ yt-dlp cookies not configured (some sites may require auth cookies)")
     log.info("✅ shazamio available: %s", SHAZAM_OK)
     cache_cleanup()
 
