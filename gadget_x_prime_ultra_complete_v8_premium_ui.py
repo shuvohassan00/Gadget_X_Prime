@@ -133,6 +133,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "download_audio_enabled": True,
     "download_video_enabled": True,
     "downloads_enabled": True,
+    "auto_protect_enabled": True,
+    "auto_protect_threshold": 6,
+    "auto_protect_window_sec": 900,
+    "auto_protect_duration_sec": 600,
     "feature_flags": {
         "shazam": True,
         "redeem": True,
@@ -535,6 +539,11 @@ def detect_platform(source: str) -> str:
 def add_platform_failure(source: str) -> None:
     platform = detect_platform(source)
     now_dt = now_utc()
+    c = cfg()
+    enabled = bool(c.get("auto_protect_enabled", True))
+    threshold = max(2, int(c.get("auto_protect_threshold", PROTECT_FAIL_THRESHOLD)))
+    window_sec = max(120, int(c.get("auto_protect_window_sec", PROTECT_FAIL_WINDOW_SEC)))
+    duration_sec = max(60, int(c.get("auto_protect_duration_sec", PROTECT_DURATION_SEC)))
     with PLATFORM_LOCK:
         PLATFORM_FAIL_COUNTS[platform] = PLATFORM_FAIL_COUNTS.get(platform, 0) + 1
         q = PLATFORM_FAIL_EVENTS.get(platform)
@@ -542,10 +551,10 @@ def add_platform_failure(source: str) -> None:
             q = deque()
             PLATFORM_FAIL_EVENTS[platform] = q
         q.append(now_dt)
-        while q and (now_dt - q[0]).total_seconds() > PROTECT_FAIL_WINDOW_SEC:
+        while q and (now_dt - q[0]).total_seconds() > window_sec:
             q.popleft()
-        if len(q) >= PROTECT_FAIL_THRESHOLD:
-            PLATFORM_PROTECT_UNTIL[platform] = now_dt + timedelta(seconds=PROTECT_DURATION_SEC)
+        if enabled and len(q) >= threshold:
+            PLATFORM_PROTECT_UNTIL[platform] = now_dt + timedelta(seconds=duration_sec)
 
 
 def render_platform_fail_stats() -> str:
@@ -564,6 +573,8 @@ def render_platform_fail_stats() -> str:
 
 
 def get_platform_protect_status(source: str) -> tuple[bool, str, int]:
+    if not bool(cfg().get("auto_protect_enabled", True)):
+        return False, detect_platform(source), 0
     platform = detect_platform(source)
     with PLATFORM_LOCK:
         until = PLATFORM_PROTECT_UNTIL.get(platform)
@@ -1161,6 +1172,10 @@ def admin_kb() -> InlineKeyboardMarkup:
     kb.add(
         InlineKeyboardButton("📉 Platform Fail Stats", callback_data="adm_fail_stats"),
         InlineKeyboardButton("🛡 Protect Status", callback_data="adm_protect_status"),
+    )
+    kb.add(
+        InlineKeyboardButton("🛡 Protect ON/OFF", callback_data="adm_protect_toggle"),
+        InlineKeyboardButton("⚙️ Protect Preset", callback_data="adm_protect_preset"),
     )
     kb.add(InlineKeyboardButton("🏠 Home", callback_data="back_home"))
     return kb
@@ -1921,7 +1936,17 @@ def cb_adm_fail_stats(call):
 def cb_adm_protect_status(call):
     if not is_admin(call.from_user.id):
         return
-    lines = ["🛡 <b>Auto-Protect Status</b>"]
+    c = cfg()
+    lines = [
+        "🛡 <b>Auto-Protect Status</b>",
+        f"Enabled: <code>{'ON' if c.get('auto_protect_enabled', True) else 'OFF'}</code>",
+        (
+            "Policy: "
+            f"<code>{c.get('auto_protect_threshold', PROTECT_FAIL_THRESHOLD)} fails / "
+            f"{int(c.get('auto_protect_window_sec', PROTECT_FAIL_WINDOW_SEC))//60}m "
+            f"→ {int(c.get('auto_protect_duration_sec', PROTECT_DURATION_SEC))//60}m cooldown</code>"
+        ),
+    ]
     with PLATFORM_LOCK:
         active = {k: v for k, v in PLATFORM_PROTECT_UNTIL.items() if v > now_utc()}
     if not active:
@@ -1931,6 +1956,47 @@ def cb_adm_protect_status(call):
             rem = int((until - now_utc()).total_seconds() // 60)
             lines.append(f"• {esc(name)}: <code>{rem} min</code> remaining")
     safe_edit(call.message.chat.id, call.message.message_id, "\n".join(lines), reply_markup=admin_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_protect_toggle")
+def cb_adm_protect_toggle(call):
+    if not is_admin(call.from_user.id):
+        return
+    current = bool(cfg().get("auto_protect_enabled", True))
+    config_col.update_one({"_id": "global"}, {"$set": {"auto_protect_enabled": not current}})
+    safe_answer_callback(call, f"Auto-protect set to {not current}", show_alert=True)
+    cb_adm_protect_status(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_protect_preset")
+def cb_adm_protect_preset(call):
+    if not is_admin(call.from_user.id):
+        return
+    txt = (
+        "⚙️ <b>Protect Preset</b>\n"
+        "Choose how strict auto-protect should be."
+    )
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🟢 Relaxed (10 fails / 15m / 5m)", callback_data="adm_pp_relaxed"))
+    kb.add(InlineKeyboardButton("🟡 Balanced (6 fails / 15m / 10m)", callback_data="adm_pp_balanced"))
+    kb.add(InlineKeyboardButton("🔴 Strict (4 fails / 10m / 15m)", callback_data="adm_pp_strict"))
+    kb.add(InlineKeyboardButton("🏠 Back Admin", callback_data="open_admin"))
+    safe_edit(call.message.chat.id, call.message.message_id, txt, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("adm_pp_relaxed", "adm_pp_balanced", "adm_pp_strict"))
+def cb_adm_protect_preset_apply(call):
+    if not is_admin(call.from_user.id):
+        return
+    if call.data == "adm_pp_relaxed":
+        payload = {"auto_protect_threshold": 10, "auto_protect_window_sec": 900, "auto_protect_duration_sec": 300}
+    elif call.data == "adm_pp_strict":
+        payload = {"auto_protect_threshold": 4, "auto_protect_window_sec": 600, "auto_protect_duration_sec": 900}
+    else:
+        payload = {"auto_protect_threshold": 6, "auto_protect_window_sec": 900, "auto_protect_duration_sec": 600}
+    config_col.update_one({"_id": "global"}, {"$set": payload})
+    safe_answer_callback(call, "Protect preset updated.", show_alert=True)
+    cb_adm_protect_status(call)
 
 
 # ---------------------------
