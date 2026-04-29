@@ -922,6 +922,21 @@ def yt_base_opts() -> Dict[str, Any]:
     return opts
 
 
+def is_youtube_source(source: str) -> bool:
+    s = (source or "").strip().lower()
+    return ("youtube.com/" in s) or ("youtu.be/" in s) or s.startswith("ytsearch")
+
+
+def yt_opts_for_source(source: str) -> Dict[str, Any]:
+    opts = yt_base_opts()
+    if is_youtube_source(source):
+        # Stale cookies can break YouTube format availability; prefer anonymous
+        # extraction/downloading for YouTube links.
+        opts.pop("cookiefile", None)
+        opts.pop("cookiesfrombrowser", None)
+    return opts
+
+
 def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int = 75) -> Dict[str, Any]:
     def runner() -> Dict[str, Any]:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -935,7 +950,7 @@ def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    opts = yt_base_opts() | {
+    opts = yt_opts_for_source(query) | {
         "default_search": f"ytsearch{limit}",
         # Keep search extraction lightweight and resilient. Full format probing for
         # each candidate can fail on geo/client-restricted videos and break the whole search.
@@ -967,8 +982,8 @@ def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
 def extract_direct_info(url: str) -> Dict[str, Any]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    primary_opts = yt_base_opts()
-    fallback_opts = yt_base_opts() | {
+    primary_opts = yt_opts_for_source(url)
+    fallback_opts = yt_opts_for_source(url) | {
         # Some platforms are more stable with a realistic mobile UA/cookies behavior.
         "http_headers": {
             "User-Agent": (
@@ -1016,8 +1031,8 @@ def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
     source = (url or "").strip()
     if not source:
         raise RuntimeError("Empty media source")
-    primary_opts = yt_base_opts() | {"format": "best"}
-    fallback_opts = yt_base_opts() | {
+    primary_opts = yt_opts_for_source(source) | {"format": "best"}
+    fallback_opts = yt_opts_for_source(source) | {
         "format": "best/bestvideo+bestaudio",
         "extractor_args": {"youtube": {"player_client": ["web", "android", "ios"]}},
     }
@@ -1089,7 +1104,7 @@ def download_audio(source: str, work_dir: Path) -> Dict[str, Any]:
     work_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(work_dir / "audio.%(ext)s")
     source = (source or "").strip()
-    opts = yt_base_opts() | {
+    opts = yt_opts_for_source(source) | {
         "outtmpl": outtmpl,
         "format": "bestaudio/best",
         "postprocessors": [
@@ -1125,7 +1140,7 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     else:
         format_selector = "bestvideo*+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best"
 
-    opts = yt_base_opts() | {
+    opts = yt_opts_for_source(source) | {
         "outtmpl": outtmpl,
         "format": format_selector,
         "merge_output_format": "mp4",
