@@ -930,11 +930,21 @@ def is_youtube_source(source: str) -> bool:
 def yt_opts_for_source(source: str) -> Dict[str, Any]:
     opts = yt_base_opts()
     if is_youtube_source(source):
-        # Stale cookies can break YouTube format availability; prefer anonymous
-        # extraction/downloading for YouTube links.
-        opts.pop("cookiefile", None)
-        opts.pop("cookiesfrombrowser", None)
+        # Keep cookie-capable defaults for YouTube. Some videos require auth.
+        pass
     return opts
+
+
+def yt_opts_variants(source: str) -> List[Dict[str, Any]]:
+    base = yt_opts_for_source(source)
+    if not is_youtube_source(source):
+        return [base]
+    no_cookie = dict(base)
+    no_cookie.pop("cookiefile", None)
+    no_cookie.pop("cookiesfrombrowser", None)
+    # Try cookie mode first (for anti-bot sign-in checks), then anonymous mode
+    # (for stale/invalid cookie issues).
+    return [base, no_cookie]
 
 
 def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int = 75) -> Dict[str, Any]:
@@ -945,6 +955,19 @@ def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ytdlp-timeout") as pool:
         fut = pool.submit(runner)
         return fut.result(timeout=timeout_sec)
+
+
+def ytdlp_extract_with_fallback_variants(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int) -> Dict[str, Any]:
+    last_exc: Optional[Exception] = None
+    for base in yt_opts_variants(source):
+        merged = base | opts
+        try:
+            return ytdlp_extract_with_timeout(source, merged, download=download, timeout_sec=timeout_sec)
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("yt-dlp extraction failed")
 
 
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -982,8 +1005,11 @@ def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
 def extract_direct_info(url: str) -> Dict[str, Any]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    primary_opts = yt_opts_for_source(url)
-    fallback_opts = yt_opts_for_source(url) | {
+    primary_opts = {
+        "quiet": True,
+        "noprogress": True,
+    }
+    fallback_opts = {
         # Some platforms are more stable with a realistic mobile UA/cookies behavior.
         "http_headers": {
             "User-Agent": (
@@ -997,7 +1023,7 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
     expanded_url = expand_redirect_url(url)
     for opts in (primary_opts, fallback_opts):
         try:
-            info = ytdlp_extract_with_timeout(expanded_url, opts, download=False, timeout_sec=70)
+            info = ytdlp_extract_with_fallback_variants(expanded_url, opts, download=False, timeout_sec=70)
             if info:
                 break
         except Exception as exc:
@@ -1117,7 +1143,7 @@ def download_audio(source: str, work_dir: Path) -> Dict[str, Any]:
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=220)
+    info = ytdlp_extract_with_fallback_variants(source, opts, download=True, timeout_sec=220)
     files = sorted(work_dir.glob("audio.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp3"), None) or (files[0] if files else None)
     if not final_file:
@@ -1148,7 +1174,7 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
     try:
-        info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
+        info = ytdlp_extract_with_fallback_variants(source, opts, download=True, timeout_sec=320)
     except Exception as exc:
         err = str(exc).lower()
         if "requested format is not available" not in err:
@@ -1156,10 +1182,10 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
         log.warning("Requested format unavailable, retrying with safe fallback selector: %s", exc)
         fallback_opts = opts | {"format": "bestvideo+bestaudio/best"}
         try:
-            info = ytdlp_extract_with_timeout(source, fallback_opts, download=True, timeout_sec=320)
+            info = ytdlp_extract_with_fallback_variants(source, fallback_opts, download=True, timeout_sec=320)
         except Exception:
             last_fallback_opts = opts | {"format": "best"}
-            info = ytdlp_extract_with_timeout(source, last_fallback_opts, download=True, timeout_sec=320)
+            info = ytdlp_extract_with_fallback_variants(source, last_fallback_opts, download=True, timeout_sec=320)
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
