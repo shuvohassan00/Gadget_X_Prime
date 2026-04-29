@@ -1057,10 +1057,9 @@ def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
     source = (url or "").strip()
     if not source:
         raise RuntimeError("Empty media source")
-    primary_opts = yt_opts_for_source(source) | {"format": "best"}
+    primary_opts = yt_opts_for_source(source)
     fallback_opts = yt_opts_for_source(source) | {
-        "format": "best/bestvideo+bestaudio",
-        "extractor_args": {"youtube": {"player_client": ["web", "android", "ios"]}},
+        "extractor_args": {"youtube": {"player_client": ["web", "android", "ios", "tv_embedded"]}},
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         primary_opts["default_search"] = "ytsearch1"
@@ -1179,6 +1178,30 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
+    def _manual_youtube_format_fallback() -> Dict[str, Any]:
+        meta = ytdlp_extract_with_fallback_variants(source, {"skip_download": True}, download=False, timeout_sec=120)
+        formats = meta.get("formats") or []
+        candidate_ids: List[str] = []
+        for f in sorted(formats, key=lambda x: (x.get("height") or 0, x.get("tbr") or 0), reverse=True):
+            fid = f.get("format_id")
+            if not fid:
+                continue
+            if f.get("vcodec") in (None, "none"):
+                continue
+            candidate_ids.append(str(fid))
+            if len(candidate_ids) >= 6:
+                break
+        last_exc: Optional[Exception] = None
+        for fid in candidate_ids:
+            try:
+                attempt_opts = opts | {"format": f"{fid}+bestaudio/{fid}/best"}
+                return ytdlp_extract_with_fallback_variants(source, attempt_opts, download=True, timeout_sec=320)
+            except Exception as exc:
+                last_exc = exc
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("No usable video format IDs found")
+
     try:
         info = ytdlp_extract_with_fallback_variants(source, opts, download=True, timeout_sec=320)
     except Exception as exc:
@@ -1191,7 +1214,13 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
             info = ytdlp_extract_with_fallback_variants(source, fallback_opts, download=True, timeout_sec=320)
         except Exception:
             last_fallback_opts = opts | {"format": "best/bestaudio"}
-            info = ytdlp_extract_with_fallback_variants(source, last_fallback_opts, download=True, timeout_sec=320)
+            try:
+                info = ytdlp_extract_with_fallback_variants(source, last_fallback_opts, download=True, timeout_sec=320)
+            except Exception:
+                if is_youtube_source(source):
+                    info = _manual_youtube_format_fallback()
+                else:
+                    raise
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
