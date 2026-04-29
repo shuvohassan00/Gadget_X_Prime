@@ -887,6 +887,9 @@ def dequeue_chat_job(chat_id: int) -> None:
 # ---------------------------
 def yt_base_opts() -> Dict[str, Any]:
     opts = {
+        # Prevent system/user yt-dlp config files from injecting custom -f selectors
+        # that can trigger "Requested format is not available" across all bot requests.
+        "ignoreconfig": True,
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
