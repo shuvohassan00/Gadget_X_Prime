@@ -887,6 +887,9 @@ def dequeue_chat_job(chat_id: int) -> None:
 # ---------------------------
 def yt_base_opts() -> Dict[str, Any]:
     opts = {
+        # Prevent system/user yt-dlp config files from injecting custom -f selectors
+        # that can trigger "Requested format is not available" across all bot requests.
+        "ignoreconfig": True,
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
@@ -901,6 +904,13 @@ def yt_base_opts() -> Dict[str, Any]:
         "geo_bypass": True,
         "extract_flat": False,
         "http_chunk_size": 10485760,
+        "extractor_args": {
+            # Prefer broadly-available YouTube clients to reduce format-resolution errors
+            # like "Requested format is not available" during metadata extraction.
+            # `formats=incomplete` helps when some clients require PO tokens and only
+            # partial format sets are exposed.
+            "youtube": {"player_client": ["android", "web"], "formats": ["incomplete"]},
+        },
     }
     if YTDLP_COOKIE_FILE:
         cookie_path = Path(YTDLP_COOKIE_FILE).expanduser()
@@ -925,7 +935,13 @@ def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    opts = yt_base_opts() | {"default_search": f"ytsearch{limit}"}
+    opts = yt_base_opts() | {
+        "default_search": f"ytsearch{limit}",
+        # Keep search extraction lightweight and resilient. Full format probing for
+        # each candidate can fail on geo/client-restricted videos and break the whole search.
+        "extract_flat": "in_playlist",
+        "ignoreerrors": True,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
     entries = []
@@ -1000,13 +1016,28 @@ def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
     source = (url or "").strip()
     if not source:
         raise RuntimeError("Empty media source")
-    opts = yt_base_opts()
+    primary_opts = yt_base_opts() | {"format": "best"}
+    fallback_opts = yt_base_opts() | {
+        "format": "best/bestvideo+bestaudio",
+        "extractor_args": {"youtube": {"player_client": ["web", "android", "ios"]}},
+    }
     if not is_url(source) and not source.startswith("ytsearch"):
-        opts["default_search"] = "ytsearch1"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = resolve_ydl_entry(ydl.extract_info(source, download=False))
+        primary_opts["default_search"] = "ytsearch1"
+        fallback_opts["default_search"] = "ytsearch1"
+    info: Dict[str, Any] = {}
+    last_exc: Optional[Exception] = None
+    for opts in (primary_opts, fallback_opts):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = resolve_ydl_entry(ydl.extract_info(source, download=False))
+            if info:
+                break
+        except Exception as exc:
+            last_exc = exc
 
     if not info:
+        if last_exc:
+            raise RuntimeError(str(last_exc))
         raise RuntimeError("Unable to extract video formats")
 
     formats = info.get("formats") or []
@@ -1101,7 +1132,19 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
+    try:
+        info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "requested format is not available" not in err:
+            raise
+        log.warning("Requested format unavailable, retrying with safe fallback selector: %s", exc)
+        fallback_opts = opts | {"format": "bestvideo+bestaudio/best"}
+        try:
+            info = ytdlp_extract_with_timeout(source, fallback_opts, download=True, timeout_sec=320)
+        except Exception:
+            last_fallback_opts = opts | {"format": "best"}
+            info = ytdlp_extract_with_timeout(source, last_fallback_opts, download=True, timeout_sec=320)
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
@@ -2565,6 +2608,11 @@ def startup_check() -> None:
     log.info("✅ ffmpeg detected at %s", ffmpeg_path)
     log.info("✅ safe upload limit set to %s", upload_limit_text())
     log.info("✅ yt-dlp available: %s", YTDLP_OK)
+    if YTDLP_OK:
+        ytdlp_ver = getattr(getattr(yt_dlp, "version", object()), "__version__", "unknown")
+        log.info("✅ yt-dlp version: %s", ytdlp_ver)
+        if isinstance(ytdlp_ver, str) and ytdlp_ver != "unknown" and ytdlp_ver < "2025.01.01":
+            log.warning("⚠️ yt-dlp version is old; update recommended to reduce YouTube format errors.")
     if YTDLP_COOKIE_FILE:
         log.info("✅ yt-dlp cookie file configured: %s", YTDLP_COOKIE_FILE)
     elif YTDLP_COOKIES_FROM_BROWSER:
