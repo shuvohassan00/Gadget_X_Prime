@@ -907,7 +907,9 @@ def yt_base_opts() -> Dict[str, Any]:
         "extractor_args": {
             # Prefer broadly-available YouTube clients to reduce format-resolution errors
             # like "Requested format is not available" during metadata extraction.
-            "youtube": {"player_client": ["android", "web"]},
+            # `formats=incomplete` helps when some clients require PO tokens and only
+            # partial format sets are exposed.
+            "youtube": {"player_client": ["android", "web"], "formats": ["incomplete"]},
         },
     }
     if YTDLP_COOKIE_FILE:
@@ -2606,6 +2608,11 @@ def startup_check() -> None:
     log.info("✅ ffmpeg detected at %s", ffmpeg_path)
     log.info("✅ safe upload limit set to %s", upload_limit_text())
     log.info("✅ yt-dlp available: %s", YTDLP_OK)
+    if YTDLP_OK:
+        ytdlp_ver = getattr(getattr(yt_dlp, "version", object()), "__version__", "unknown")
+        log.info("✅ yt-dlp version: %s", ytdlp_ver)
+        if isinstance(ytdlp_ver, str) and ytdlp_ver != "unknown" and ytdlp_ver < "2025.01.01":
+            log.warning("⚠️ yt-dlp version is old; update recommended to reduce YouTube format errors.")
     if YTDLP_COOKIE_FILE:
         log.info("✅ yt-dlp cookie file configured: %s", YTDLP_COOKIE_FILE)
     elif YTDLP_COOKIES_FROM_BROWSER:
