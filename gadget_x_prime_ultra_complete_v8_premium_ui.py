@@ -1156,7 +1156,12 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     source = (source or "").strip()
     outtmpl = str(work_dir / "video.%(ext)s")
     if format_id:
-        format_selector = f"{format_id}+bestaudio/{format_id}/best"
+        format_selector = (
+            f"{format_id}+bestaudio/"
+            f"{format_id}/"
+            "bestvideo*+bestaudio/"
+            "best[vcodec!=none]/best"
+        )
     elif max_height:
         format_selector = (
             f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -1170,6 +1175,7 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
         "outtmpl": outtmpl,
         "format": format_selector,
         "merge_output_format": "mp4",
+        "allow_unplayable_formats": True,
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
@@ -1180,11 +1186,11 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
         if "requested format is not available" not in err:
             raise
         log.warning("Requested format unavailable, retrying with safe fallback selector: %s", exc)
-        fallback_opts = opts | {"format": "bestvideo+bestaudio/best"}
+        fallback_opts = opts | {"format": "bestvideo*+bestaudio/best[vcodec!=none]/best"}
         try:
             info = ytdlp_extract_with_fallback_variants(source, fallback_opts, download=True, timeout_sec=320)
         except Exception:
-            last_fallback_opts = opts | {"format": "best"}
+            last_fallback_opts = opts | {"format": "best/bestaudio"}
             info = ytdlp_extract_with_fallback_variants(source, last_fallback_opts, download=True, timeout_sec=320)
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
