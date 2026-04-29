@@ -1101,7 +1101,15 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
+    try:
+        info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "requested format is not available" not in err:
+            raise
+        log.warning("Requested format unavailable, retrying with safe fallback selector: %s", exc)
+        fallback_opts = opts | {"format": "bestvideo+bestaudio/best"}
+        info = ytdlp_extract_with_timeout(source, fallback_opts, download=True, timeout_sec=320)
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
