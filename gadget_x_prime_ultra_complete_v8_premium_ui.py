@@ -925,7 +925,13 @@ def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    opts = yt_base_opts() | {"default_search": f"ytsearch{limit}"}
+    opts = yt_base_opts() | {
+        "default_search": f"ytsearch{limit}",
+        # Keep search extraction lightweight and resilient. Full format probing for
+        # each candidate can fail on geo/client-restricted videos and break the whole search.
+        "extract_flat": "in_playlist",
+        "ignoreerrors": True,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
     entries = []
