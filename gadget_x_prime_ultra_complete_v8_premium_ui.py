@@ -901,6 +901,11 @@ def yt_base_opts() -> Dict[str, Any]:
         "geo_bypass": True,
         "extract_flat": False,
         "http_chunk_size": 10485760,
+        "extractor_args": {
+            # Prefer broadly-available YouTube clients to reduce format-resolution errors
+            # like "Requested format is not available" during metadata extraction.
+            "youtube": {"player_client": ["android", "web"]},
+        },
     }
     if YTDLP_COOKIE_FILE:
         cookie_path = Path(YTDLP_COOKIE_FILE).expanduser()
@@ -1006,13 +1011,28 @@ def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
     source = (url or "").strip()
     if not source:
         raise RuntimeError("Empty media source")
-    opts = yt_base_opts()
+    primary_opts = yt_base_opts() | {"format": "best"}
+    fallback_opts = yt_base_opts() | {
+        "format": "best/bestvideo+bestaudio",
+        "extractor_args": {"youtube": {"player_client": ["web", "android", "ios"]}},
+    }
     if not is_url(source) and not source.startswith("ytsearch"):
-        opts["default_search"] = "ytsearch1"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = resolve_ydl_entry(ydl.extract_info(source, download=False))
+        primary_opts["default_search"] = "ytsearch1"
+        fallback_opts["default_search"] = "ytsearch1"
+    info: Dict[str, Any] = {}
+    last_exc: Optional[Exception] = None
+    for opts in (primary_opts, fallback_opts):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = resolve_ydl_entry(ydl.extract_info(source, download=False))
+            if info:
+                break
+        except Exception as exc:
+            last_exc = exc
 
     if not info:
+        if last_exc:
+            raise RuntimeError(str(last_exc))
         raise RuntimeError("Unable to extract video formats")
 
     formats = info.get("formats") or []
@@ -1115,7 +1135,11 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
             raise
         log.warning("Requested format unavailable, retrying with safe fallback selector: %s", exc)
         fallback_opts = opts | {"format": "bestvideo+bestaudio/best"}
-        info = ytdlp_extract_with_timeout(source, fallback_opts, download=True, timeout_sec=320)
+        try:
+            info = ytdlp_extract_with_timeout(source, fallback_opts, download=True, timeout_sec=320)
+        except Exception:
+            last_fallback_opts = opts | {"format": "best"}
+            info = ytdlp_extract_with_timeout(source, last_fallback_opts, download=True, timeout_sec=320)
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
