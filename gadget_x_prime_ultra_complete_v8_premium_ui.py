@@ -887,6 +887,9 @@ def dequeue_chat_job(chat_id: int) -> None:
 # ---------------------------
 def yt_base_opts() -> Dict[str, Any]:
     opts = {
+        # Prevent system/user yt-dlp config files from injecting custom -f selectors
+        # that can trigger "Requested format is not available" across all bot requests.
+        "ignoreconfig": True,
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
@@ -901,6 +904,13 @@ def yt_base_opts() -> Dict[str, Any]:
         "geo_bypass": True,
         "extract_flat": False,
         "http_chunk_size": 10485760,
+        "extractor_args": {
+            # Prefer broadly-available YouTube clients to reduce format-resolution errors
+            # like "Requested format is not available" during metadata extraction.
+            # `formats=incomplete` helps when some clients require PO tokens and only
+            # partial format sets are exposed.
+            "youtube": {"player_client": ["android", "web"], "formats": ["incomplete"]},
+        },
     }
     if YTDLP_COOKIE_FILE:
         cookie_path = Path(YTDLP_COOKIE_FILE).expanduser()
@@ -910,6 +920,31 @@ def yt_base_opts() -> Dict[str, Any]:
         # Supported values: chrome, chromium, firefox, edge, brave, opera, vivaldi, safari
         opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER,)
     return opts
+
+
+def is_youtube_source(source: str) -> bool:
+    s = (source or "").strip().lower()
+    return ("youtube.com/" in s) or ("youtu.be/" in s) or s.startswith("ytsearch")
+
+
+def yt_opts_for_source(source: str) -> Dict[str, Any]:
+    opts = yt_base_opts()
+    if is_youtube_source(source):
+        # Keep cookie-capable defaults for YouTube. Some videos require auth.
+        pass
+    return opts
+
+
+def yt_opts_variants(source: str) -> List[Dict[str, Any]]:
+    base = yt_opts_for_source(source)
+    if not is_youtube_source(source):
+        return [base]
+    no_cookie = dict(base)
+    no_cookie.pop("cookiefile", None)
+    no_cookie.pop("cookiesfrombrowser", None)
+    # Try cookie mode first (for anti-bot sign-in checks), then anonymous mode
+    # (for stale/invalid cookie issues).
+    return [base, no_cookie]
 
 
 def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int = 75) -> Dict[str, Any]:
@@ -922,10 +957,29 @@ def ytdlp_extract_with_timeout(source: str, opts: Dict[str, Any], download: bool
         return fut.result(timeout=timeout_sec)
 
 
+def ytdlp_extract_with_fallback_variants(source: str, opts: Dict[str, Any], download: bool, timeout_sec: int) -> Dict[str, Any]:
+    last_exc: Optional[Exception] = None
+    for base in yt_opts_variants(source):
+        merged = base | opts
+        try:
+            return ytdlp_extract_with_timeout(source, merged, download=download, timeout_sec=timeout_sec)
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("yt-dlp extraction failed")
+
+
 def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    opts = yt_base_opts() | {"default_search": f"ytsearch{limit}"}
+    opts = yt_opts_for_source(query) | {
+        "default_search": f"ytsearch{limit}",
+        # Keep search extraction lightweight and resilient. Full format probing for
+        # each candidate can fail on geo/client-restricted videos and break the whole search.
+        "extract_flat": "in_playlist",
+        "ignoreerrors": True,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
     entries = []
@@ -951,8 +1005,11 @@ def search_media(query: str, limit: int = 8) -> List[Dict[str, Any]]:
 def extract_direct_info(url: str) -> Dict[str, Any]:
     if not YTDLP_OK:
         raise RuntimeError("yt-dlp is not installed")
-    primary_opts = yt_base_opts()
-    fallback_opts = yt_base_opts() | {
+    primary_opts = {
+        "quiet": True,
+        "noprogress": True,
+    }
+    fallback_opts = {
         # Some platforms are more stable with a realistic mobile UA/cookies behavior.
         "http_headers": {
             "User-Agent": (
@@ -966,7 +1023,7 @@ def extract_direct_info(url: str) -> Dict[str, Any]:
     expanded_url = expand_redirect_url(url)
     for opts in (primary_opts, fallback_opts):
         try:
-            info = ytdlp_extract_with_timeout(expanded_url, opts, download=False, timeout_sec=70)
+            info = ytdlp_extract_with_fallback_variants(expanded_url, opts, download=False, timeout_sec=70)
             if info:
                 break
         except Exception as exc:
@@ -1000,13 +1057,27 @@ def pick_video_qualities(url: str) -> List[Dict[str, Any]]:
     source = (url or "").strip()
     if not source:
         raise RuntimeError("Empty media source")
-    opts = yt_base_opts()
+    primary_opts = yt_opts_for_source(source)
+    fallback_opts = yt_opts_for_source(source) | {
+        "extractor_args": {"youtube": {"player_client": ["web", "android", "ios", "tv_embedded"]}},
+    }
     if not is_url(source) and not source.startswith("ytsearch"):
-        opts["default_search"] = "ytsearch1"
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = resolve_ydl_entry(ydl.extract_info(source, download=False))
+        primary_opts["default_search"] = "ytsearch1"
+        fallback_opts["default_search"] = "ytsearch1"
+    info: Dict[str, Any] = {}
+    last_exc: Optional[Exception] = None
+    for opts in (primary_opts, fallback_opts):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = resolve_ydl_entry(ydl.extract_info(source, download=False))
+            if info:
+                break
+        except Exception as exc:
+            last_exc = exc
 
     if not info:
+        if last_exc:
+            raise RuntimeError(str(last_exc))
         raise RuntimeError("Unable to extract video formats")
 
     formats = info.get("formats") or []
@@ -1058,7 +1129,7 @@ def download_audio(source: str, work_dir: Path) -> Dict[str, Any]:
     work_dir.mkdir(parents=True, exist_ok=True)
     outtmpl = str(work_dir / "audio.%(ext)s")
     source = (source or "").strip()
-    opts = yt_base_opts() | {
+    opts = yt_opts_for_source(source) | {
         "outtmpl": outtmpl,
         "format": "bestaudio/best",
         "postprocessors": [
@@ -1071,7 +1142,7 @@ def download_audio(source: str, work_dir: Path) -> Dict[str, Any]:
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=220)
+    info = ytdlp_extract_with_fallback_variants(source, opts, download=True, timeout_sec=220)
     files = sorted(work_dir.glob("audio.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp3"), None) or (files[0] if files else None)
     if not final_file:
@@ -1084,7 +1155,12 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     source = (source or "").strip()
     outtmpl = str(work_dir / "video.%(ext)s")
     if format_id:
-        format_selector = f"{format_id}+bestaudio/{format_id}/best"
+        format_selector = (
+            f"{format_id}+bestaudio/"
+            f"{format_id}/"
+            "bestvideo*+bestaudio/"
+            "best[vcodec!=none]/best"
+        )
     elif max_height:
         format_selector = (
             f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -1094,14 +1170,57 @@ def download_video(source: str, format_id: Optional[str], max_height: Optional[i
     else:
         format_selector = "bestvideo*+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best"
 
-    opts = yt_base_opts() | {
+    opts = yt_opts_for_source(source) | {
         "outtmpl": outtmpl,
         "format": format_selector,
         "merge_output_format": "mp4",
+        "allow_unplayable_formats": True,
     }
     if not is_url(source) and not source.startswith("ytsearch"):
         opts["default_search"] = "ytsearch1"
-    info = ytdlp_extract_with_timeout(source, opts, download=True, timeout_sec=320)
+    def _manual_youtube_format_fallback() -> Dict[str, Any]:
+        meta = ytdlp_extract_with_fallback_variants(source, {"skip_download": True}, download=False, timeout_sec=120)
+        formats = meta.get("formats") or []
+        candidate_ids: List[str] = []
+        for f in sorted(formats, key=lambda x: (x.get("height") or 0, x.get("tbr") or 0), reverse=True):
+            fid = f.get("format_id")
+            if not fid:
+                continue
+            if f.get("vcodec") in (None, "none"):
+                continue
+            candidate_ids.append(str(fid))
+            if len(candidate_ids) >= 6:
+                break
+        last_exc: Optional[Exception] = None
+        for fid in candidate_ids:
+            try:
+                attempt_opts = opts | {"format": f"{fid}+bestaudio/{fid}/best"}
+                return ytdlp_extract_with_fallback_variants(source, attempt_opts, download=True, timeout_sec=320)
+            except Exception as exc:
+                last_exc = exc
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("No usable video format IDs found")
+
+    try:
+        info = ytdlp_extract_with_fallback_variants(source, opts, download=True, timeout_sec=320)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "requested format is not available" not in err:
+            raise
+        log.warning("Requested format unavailable, retrying with safe fallback selector: %s", exc)
+        fallback_opts = opts | {"format": "bestvideo*+bestaudio/best[vcodec!=none]/best"}
+        try:
+            info = ytdlp_extract_with_fallback_variants(source, fallback_opts, download=True, timeout_sec=320)
+        except Exception:
+            last_fallback_opts = opts | {"format": "best/bestaudio"}
+            try:
+                info = ytdlp_extract_with_fallback_variants(source, last_fallback_opts, download=True, timeout_sec=320)
+            except Exception:
+                if is_youtube_source(source):
+                    info = _manual_youtube_format_fallback()
+                else:
+                    raise
     files = sorted(work_dir.glob("video.*"), key=lambda p: p.stat().st_mtime, reverse=True)
     final_file = next((p for p in files if p.suffix.lower() == ".mp4"), None) or (files[0] if files else None)
     if not final_file:
@@ -2565,6 +2684,11 @@ def startup_check() -> None:
     log.info("✅ ffmpeg detected at %s", ffmpeg_path)
     log.info("✅ safe upload limit set to %s", upload_limit_text())
     log.info("✅ yt-dlp available: %s", YTDLP_OK)
+    if YTDLP_OK:
+        ytdlp_ver = getattr(getattr(yt_dlp, "version", object()), "__version__", "unknown")
+        log.info("✅ yt-dlp version: %s", ytdlp_ver)
+        if isinstance(ytdlp_ver, str) and ytdlp_ver != "unknown" and ytdlp_ver < "2025.01.01":
+            log.warning("⚠️ yt-dlp version is old; update recommended to reduce YouTube format errors.")
     if YTDLP_COOKIE_FILE:
         log.info("✅ yt-dlp cookie file configured: %s", YTDLP_COOKIE_FILE)
     elif YTDLP_COOKIES_FROM_BROWSER:
